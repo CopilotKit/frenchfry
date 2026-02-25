@@ -12,6 +12,7 @@ import type {
   CoreClientEvent,
   CoreServerEvent,
   CreateRealtimeClientOptions,
+  FunctionCallArgumentsDoneEvent,
   RealtimeMediaStreamLike,
   RealtimeMediaStreamTrackLike,
   RealtimeClient,
@@ -37,6 +38,7 @@ export const createRealtimeClient = (
   const toolCallStartsSubject = new Subject<ToolCallStart>();
   const remoteAudioStreamSubject = new Subject<MediaStream>();
   const callArgumentStreams = new Map<string, Subject<string>>();
+  const callArgumentTextById = new Map<string, string>();
   const callNameById = new Map<string, string>();
 
   let peerConnection: RealtimePeerConnectionLike | null = null;
@@ -87,6 +89,7 @@ export const createRealtimeClient = (
 
     const dataChannelOpenPromise = wireDataChannel({
       callArgumentStreams,
+      callArgumentTextById,
       callNameById,
       dataChannel: nextDataChannel,
       eventsSubject,
@@ -108,6 +111,7 @@ export const createRealtimeClient = (
 
       teardownConnection({
         callArgumentStreams,
+        callArgumentTextById,
         callNameById,
         dataChannel,
         eventsSubject,
@@ -147,6 +151,7 @@ export const createRealtimeClient = (
     if (answerSdp === null) {
       teardownConnection({
         callArgumentStreams,
+        callArgumentTextById,
         callNameById,
         dataChannel,
         eventsSubject,
@@ -172,6 +177,7 @@ export const createRealtimeClient = (
   const disconnect = (): void => {
     teardownConnection({
       callArgumentStreams,
+      callArgumentTextById,
       callNameById,
       dataChannel,
       eventsSubject,
@@ -233,6 +239,7 @@ export const createRealtimeClient = (
 
 type TeardownInput = {
   callArgumentStreams: Map<string, Subject<string>>;
+  callArgumentTextById: Map<string, string>;
   callNameById: Map<string, string>;
   dataChannel: RealtimeDataChannelLike | null;
   eventsSubject: Subject<CoreServerEvent>;
@@ -271,6 +278,7 @@ const teardownConnection = (input: TeardownInput): void => {
     track.stop();
   });
   completeCallStreams(input.callArgumentStreams);
+  input.callArgumentTextById.clear();
   input.callNameById.clear();
   input.eventsSubject.next({
     type: "runtime.connection.closed"
@@ -304,6 +312,7 @@ const createPeerConnection = (
 
 type WireDataChannelInput = {
   callArgumentStreams: Map<string, Subject<string>>;
+  callArgumentTextById: Map<string, string>;
   callNameById: Map<string, string>;
   dataChannel: RealtimeDataChannelLike;
   eventsSubject: Subject<CoreServerEvent>;
@@ -333,6 +342,7 @@ const wireDataChannel = (input: WireDataChannelInput): Promise<void> => {
 
     input.dataChannel.onclose = () => {
       completeCallStreams(input.callArgumentStreams);
+      input.callArgumentTextById.clear();
       input.eventsSubject.next({
         type: "runtime.connection.closed"
       });
@@ -344,6 +354,7 @@ const wireDataChannel = (input: WireDataChannelInput): Promise<void> => {
         input.eventsSubject,
         input.toolCallStartsSubject,
         input.callArgumentStreams,
+        input.callArgumentTextById,
         input.callNameById
       );
     };
@@ -641,6 +652,7 @@ const handleIncomingMessage = (
   eventsSubject: Subject<CoreServerEvent>,
   toolCallStartsSubject: Subject<ToolCallStart>,
   callArgumentStreams: Map<string, Subject<string>>,
+  callArgumentTextById: Map<string, string>,
   callNameById: Map<string, string>
 ): void => {
   const parsedJson = parseJsonRecord(serialized);
@@ -667,36 +679,350 @@ const handleIncomingMessage = (
   }
 
   const normalizedEvent = enrichDoneEventWithCallMetadata(event, callNameById);
+  const normalizedEvents = createNormalizedEventBatch(
+    parsedJson,
+    normalizedEvent,
+    callArgumentTextById,
+    callNameById
+  );
+  debugToolLoop("incoming", {
+    normalizedTypes: normalizedEvents.map((nextEvent) => nextEvent.type),
+    rawType: parsedJson.type
+  });
 
-  if (isFunctionCallArgumentsDeltaEvent(normalizedEvent)) {
-    const existingStream = callArgumentStreams.get(normalizedEvent.call_id);
+  normalizedEvents.forEach((nextEvent) => {
+    processToolCallStreamEvent({
+      callArgumentStreams,
+      callArgumentTextById,
+      callNameById,
+      event: nextEvent,
+      toolCallStartsSubject
+    });
+    eventsSubject.next(nextEvent);
+  });
+};
+
+type ProcessToolCallStreamEventInput = {
+  callArgumentStreams: Map<string, Subject<string>>;
+  callArgumentTextById: Map<string, string>;
+  callNameById: Map<string, string>;
+  event: CoreServerEvent;
+  toolCallStartsSubject: Subject<ToolCallStart>;
+};
+
+/**
+ * Routes normalized function-call events into per-call argument streams.
+ *
+ * @param input Normalized event plus mutable stream maps.
+ */
+const processToolCallStreamEvent = (
+  input: ProcessToolCallStreamEventInput
+): void => {
+  if (isFunctionCallArgumentsDeltaEvent(input.event)) {
+    debugToolLoop("delta", {
+      callId: input.event.call_id,
+      deltaLength: input.event.delta.length
+    });
+    const existingStream = input.callArgumentStreams.get(input.event.call_id);
+    const previousArgumentText =
+      input.callArgumentTextById.get(input.event.call_id) ?? "";
+    input.callArgumentTextById.set(
+      input.event.call_id,
+      `${previousArgumentText}${input.event.delta}`
+    );
 
     if (existingStream === undefined) {
       const nextStream = new Subject<string>();
-      callArgumentStreams.set(normalizedEvent.call_id, nextStream);
-      toolCallStartsSubject.next({
+      input.callArgumentStreams.set(input.event.call_id, nextStream);
+      input.toolCallStartsSubject.next({
         argumentChunks$: nextStream.asObservable(),
-        callId: normalizedEvent.call_id,
-        itemId: normalizedEvent.item_id ?? normalizedEvent.call_id,
-        responseId: normalizedEvent.response_id ?? "unknown_response"
+        callId: input.event.call_id,
+        itemId: input.event.item_id ?? input.event.call_id,
+        responseId: input.event.response_id ?? "unknown_response"
       });
-      nextStream.next(normalizedEvent.delta);
+      nextStream.next(input.event.delta);
     } else {
-      existingStream.next(normalizedEvent.delta);
+      existingStream.next(input.event.delta);
+    }
+
+    return;
+  }
+
+  if (!isFunctionCallArgumentsDoneEvent(input.event)) {
+    return;
+  }
+  debugToolLoop("done", {
+    argumentsLength: input.event.arguments.length,
+    callId: input.event.call_id,
+    name: input.event.name
+  });
+
+  const existingStream = input.callArgumentStreams.get(input.event.call_id);
+  const stream = existingStream ?? new Subject<string>();
+
+  if (existingStream === undefined) {
+    input.callArgumentStreams.set(input.event.call_id, stream);
+    input.toolCallStartsSubject.next({
+      argumentChunks$: stream.asObservable(),
+      callId: input.event.call_id,
+      itemId: input.event.item_id ?? input.event.call_id,
+      responseId: input.event.response_id ?? "unknown_response"
+    });
+
+    if (input.event.arguments.length > 0) {
+      stream.next(input.event.arguments);
     }
   }
 
-  if (isFunctionCallArgumentsDoneEvent(normalizedEvent)) {
-    const stream = callArgumentStreams.get(normalizedEvent.call_id);
+  stream.complete();
+  input.callArgumentStreams.delete(input.event.call_id);
+  input.callArgumentTextById.delete(input.event.call_id);
+  input.callNameById.delete(input.event.call_id);
+};
 
-    if (stream !== undefined) {
-      stream.complete();
-      callArgumentStreams.delete(normalizedEvent.call_id);
-    }
-    callNameById.delete(normalizedEvent.call_id);
+/**
+ * Creates a normalized event batch, including synthesized function-call done events.
+ *
+ * @param rawPayload Raw parsed server payload.
+ * @param parsedEvent Parsed core server event.
+ * @param callNameById Known call-id to tool-name mapping.
+ * @returns Ordered event batch to emit.
+ */
+const createNormalizedEventBatch = (
+  rawPayload: Readonly<Record<string, unknown>>,
+  parsedEvent: CoreServerEvent,
+  callArgumentTextById: ReadonlyMap<string, string>,
+  callNameById: ReadonlyMap<string, string>
+): readonly CoreServerEvent[] => {
+  const outputItemDoneEvents = extractFunctionCallDoneEventsFromOutputItemDone(
+    rawPayload,
+    callArgumentTextById,
+    callNameById
+  );
+  const conversationItemAddedEvents =
+    extractFunctionCallDoneEventsFromConversationItemAdded(rawPayload).map(
+      (event) => {
+        return enrichDoneEventMetadata(event, callNameById);
+      }
+    );
+  const conversationItemDoneEvents =
+    extractFunctionCallDoneEventsFromConversationItemDone(rawPayload).map(
+      (event) => {
+        return enrichDoneEventMetadata(event, callNameById);
+      }
+    );
+  const extractedDoneEvents =
+    extractFunctionCallDoneEventsFromResponseDone(rawPayload);
+  const responseDoneEvents = extractedDoneEvents.map((event) => {
+    return enrichDoneEventMetadata(event, callNameById);
+  });
+  const synthesizedDoneEvents = dedupeDoneEvents([
+    ...outputItemDoneEvents,
+    ...conversationItemAddedEvents,
+    ...conversationItemDoneEvents,
+    ...responseDoneEvents
+  ]);
+  if (outputItemDoneEvents.length > 0) {
+    debugToolLoop("response.output_item.done synthesized", {
+      callIds: outputItemDoneEvents.map((event) => event.call_id),
+      count: outputItemDoneEvents.length
+    });
+  }
+  if (extractedDoneEvents.length > 0) {
+    debugToolLoop("response.done synthesized", {
+      callIds: extractedDoneEvents.map((event) => event.call_id),
+      count: extractedDoneEvents.length
+    });
+  }
+  if (conversationItemAddedEvents.length > 0) {
+    debugToolLoop("conversation.item.added synthesized", {
+      callIds: conversationItemAddedEvents.map((event) => event.call_id),
+      count: conversationItemAddedEvents.length
+    });
+  }
+  if (conversationItemDoneEvents.length > 0) {
+    debugToolLoop("conversation.item.done synthesized", {
+      callIds: conversationItemDoneEvents.map((event) => event.call_id),
+      count: conversationItemDoneEvents.length
+    });
   }
 
-  eventsSubject.next(normalizedEvent);
+  if (synthesizedDoneEvents.length === 0) {
+    return [parsedEvent];
+  }
+
+  return [parsedEvent, ...synthesizedDoneEvents];
+};
+
+/**
+ * Extracts function-call completion events from a `response.output_item.done` payload.
+ *
+ * @param payload Parsed server payload.
+ * @param callArgumentTextById Known call-id to accumulated argument text.
+ * @param callNameById Known call-id to tool-name mapping.
+ * @returns Normalized done events discovered in output-item payload.
+ */
+const extractFunctionCallDoneEventsFromOutputItemDone = (
+  payload: Readonly<Record<string, unknown>>,
+  callArgumentTextById: ReadonlyMap<string, string>,
+  callNameById: ReadonlyMap<string, string>
+): readonly FunctionCallArgumentsDoneEvent[] => {
+  if (payload.type !== "response.output_item.done") {
+    return [];
+  }
+
+  const item = toUnknownRecord(payload.item);
+  if (item === null || item.type !== "function_call") {
+    return [];
+  }
+
+  if (typeof item.call_id !== "string") {
+    return [];
+  }
+
+  const serializedArguments = serializeFunctionArguments(item.arguments);
+  const fallbackArguments = callArgumentTextById.get(item.call_id);
+  const resolvedArguments =
+    serializedArguments === null ? fallbackArguments : serializedArguments;
+  const fallbackName = callNameById.get(item.call_id);
+
+  if (resolvedArguments === undefined) {
+    return [];
+  }
+
+  const doneEvent: FunctionCallArgumentsDoneEvent = {
+    arguments: resolvedArguments,
+    call_id: item.call_id,
+    ...(typeof item.id === "string" ? { item_id: item.id } : {}),
+    ...(typeof item.name === "string"
+      ? { name: item.name }
+      : fallbackName === undefined
+        ? {}
+        : { name: fallbackName }),
+    ...(typeof payload.output_index === "number"
+      ? { output_index: payload.output_index }
+      : {}),
+    ...(typeof payload.response_id === "string"
+      ? { response_id: payload.response_id }
+      : {}),
+    type: "response.function_call_arguments.done"
+  };
+
+  return [doneEvent];
+};
+
+/**
+ * Extracts function-call completion events from a `conversation.item.done` payload.
+ *
+ * @param payload Parsed server payload.
+ * @returns Normalized done events discovered in conversation item payload.
+ */
+const extractFunctionCallDoneEventsFromConversationItemDone = (
+  payload: Readonly<Record<string, unknown>>
+): readonly FunctionCallArgumentsDoneEvent[] => {
+  if (payload.type !== "conversation.item.done") {
+    return [];
+  }
+
+  const item = toUnknownRecord(payload.item);
+  if (item === null) {
+    return [];
+  }
+
+  if (item.type !== "function_call") {
+    return [];
+  }
+
+  if (typeof item.call_id !== "string") {
+    return [];
+  }
+
+  const serializedArguments = serializeFunctionArguments(item.arguments);
+  if (serializedArguments === null) {
+    return [];
+  }
+
+  const doneEvent: FunctionCallArgumentsDoneEvent = {
+    arguments: serializedArguments,
+    call_id: item.call_id,
+    ...(typeof item.id === "string" ? { item_id: item.id } : {}),
+    ...(typeof item.name === "string" ? { name: item.name } : {}),
+    ...(typeof payload.response_id === "string"
+      ? { response_id: payload.response_id }
+      : {}),
+    type: "response.function_call_arguments.done"
+  };
+
+  return [doneEvent];
+};
+
+/**
+ * Extracts function-call completion events from a `conversation.item.added` payload.
+ *
+ * @param payload Parsed server payload.
+ * @returns Normalized done events when a completed function-call item is included.
+ */
+const extractFunctionCallDoneEventsFromConversationItemAdded = (
+  payload: Readonly<Record<string, unknown>>
+): readonly FunctionCallArgumentsDoneEvent[] => {
+  if (payload.type !== "conversation.item.added") {
+    return [];
+  }
+
+  const item = toUnknownRecord(payload.item);
+  if (item === null) {
+    return [];
+  }
+
+  if (item.type !== "function_call" || item.status !== "completed") {
+    return [];
+  }
+
+  if (typeof item.call_id !== "string") {
+    return [];
+  }
+
+  const serializedArguments = serializeFunctionArguments(item.arguments);
+  if (serializedArguments === null) {
+    return [];
+  }
+
+  const doneEvent: FunctionCallArgumentsDoneEvent = {
+    arguments: serializedArguments,
+    call_id: item.call_id,
+    ...(typeof item.id === "string" ? { item_id: item.id } : {}),
+    ...(typeof item.name === "string" ? { name: item.name } : {}),
+    ...(typeof payload.response_id === "string"
+      ? { response_id: payload.response_id }
+      : {}),
+    type: "response.function_call_arguments.done"
+  };
+
+  return [doneEvent];
+};
+
+/**
+ * Deduplicates normalized done events by stable event identity fields.
+ *
+ * @param events Candidate done events.
+ * @returns Deduplicated done events.
+ */
+const dedupeDoneEvents = (
+  events: readonly FunctionCallArgumentsDoneEvent[]
+): readonly FunctionCallArgumentsDoneEvent[] => {
+  const seen = new Set<string>();
+  const deduped: FunctionCallArgumentsDoneEvent[] = [];
+
+  events.forEach((event) => {
+    const key = `${event.call_id}::${event.arguments}::${event.name ?? ""}::${event.item_id ?? ""}::${event.response_id ?? ""}`;
+    if (seen.has(key)) {
+      return;
+    }
+    seen.add(key);
+    deduped.push(event);
+  });
+
+  return deduped;
 };
 
 /**
@@ -762,6 +1088,141 @@ const enrichDoneEventWithCallMetadata = (
 };
 
 /**
+ * Enriches a normalized done event with known call metadata while preserving event type.
+ *
+ * @param event Done event.
+ * @param callNameById Known call-id to tool-name mapping.
+ * @returns Done event with optional name filled from known metadata.
+ */
+const enrichDoneEventMetadata = (
+  event: FunctionCallArgumentsDoneEvent,
+  callNameById: ReadonlyMap<string, string>
+): FunctionCallArgumentsDoneEvent => {
+  const enriched = enrichDoneEventWithCallMetadata(event, callNameById);
+  if (!isFunctionCallArgumentsDoneEvent(enriched)) {
+    return event;
+  }
+
+  return enriched;
+};
+
+/**
+ * Extracts function-call completion events from a `response.done` payload.
+ *
+ * @param payload Parsed server payload.
+ * @returns Normalized done events discovered in response output items.
+ */
+const extractFunctionCallDoneEventsFromResponseDone = (
+  payload: Readonly<Record<string, unknown>>
+): readonly FunctionCallArgumentsDoneEvent[] => {
+  if (payload.type !== "response.done") {
+    return [];
+  }
+
+  const response = toUnknownRecord(payload.response);
+  if (response === null) {
+    return [];
+  }
+
+  const output = response.output;
+  if (!Array.isArray(output)) {
+    return [];
+  }
+
+  const responseId = typeof response.id === "string" ? response.id : undefined;
+  const events: FunctionCallArgumentsDoneEvent[] = [];
+
+  output.forEach((item, outputIndex) => {
+    const itemRecord = toUnknownRecord(item);
+    if (itemRecord === null) {
+      return;
+    }
+
+    if (itemRecord.type !== "function_call") {
+      return;
+    }
+
+    if (typeof itemRecord.call_id !== "string") {
+      return;
+    }
+
+    const serializedArguments = serializeFunctionArguments(itemRecord.arguments);
+    if (serializedArguments === null) {
+      return;
+    }
+
+    const doneEvent: FunctionCallArgumentsDoneEvent = {
+      arguments: serializedArguments,
+      call_id: itemRecord.call_id,
+      output_index: outputIndex,
+      ...(responseId === undefined ? {} : { response_id: responseId }),
+      ...(typeof itemRecord.id === "string" ? { item_id: itemRecord.id } : {}),
+      ...(typeof itemRecord.name === "string" ? { name: itemRecord.name } : {}),
+      type: "response.function_call_arguments.done"
+    };
+
+    events.push(doneEvent);
+  });
+
+  return events;
+};
+
+/**
+ * Narrows unknown runtime values to object records.
+ *
+ * @param value Runtime value.
+ * @returns Record value, or `null` when value is not an object.
+ */
+const toUnknownRecord = (
+  value: unknown
+): Readonly<Record<string, unknown>> | null => {
+  const parsed = jsonRecordSchema.safeParse(value);
+  if (!parsed.success) {
+    return null;
+  }
+
+  return parsed.data;
+};
+
+/**
+ * Emits debug logs for tool-loop behavior when enabled by global flag.
+ *
+ * @param message Log message.
+ * @param payload Optional structured payload.
+ */
+const debugToolLoop = (
+  message: string,
+  payload?: Readonly<Record<string, unknown>>
+): void => {
+  if (payload === undefined) {
+    console.log("[frenchfry:core:tool-loop]", message);
+    return;
+  }
+
+  console.log(
+    "[frenchfry:core:tool-loop]",
+    message,
+    serializeDebugPayload(payload)
+  );
+};
+
+/**
+ * Safely serializes debug payloads for copy/paste logging.
+ *
+ * @param payload Debug payload object.
+ * @returns JSON string representation.
+ */
+const serializeDebugPayload = (
+  payload: Readonly<Record<string, unknown>>
+): string => {
+  try {
+    return JSON.stringify(payload);
+  } catch {
+    return '{"serialization_error":true}';
+  }
+};
+
+/**
  * Parses serialized JSON into an object record.
  *
  * @param serialized Raw json string.
@@ -777,6 +1238,28 @@ const parseJsonRecord = (
       return null;
     }
     return result.data;
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * Normalizes function-call argument payloads into strings for downstream parsing.
+ *
+ * @param value Runtime argument payload from server events.
+ * @returns Argument string, or `null` when value is missing or not serializable.
+ */
+const serializeFunctionArguments = (value: unknown): string | null => {
+  if (value === undefined) {
+    return null;
+  }
+
+  if (typeof value === "string") {
+    return value;
+  }
+
+  try {
+    return JSON.stringify(value);
   } catch {
     return null;
   }

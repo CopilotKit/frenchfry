@@ -491,6 +491,60 @@ test("argument stream completes when done event arrives", async () => {
   expect(completed).toBe(true);
 });
 
+test("done-only tool calls emit a stream start with raw arguments before completion", async () => {
+  // Arrange
+  const peer = new FakePeerConnection();
+  const client = createRealtimeClient({
+    fetchImpl: () =>
+      Promise.resolve(new Response("answer-sdp", { status: 200 })),
+    peerConnectionFactory: () => peer,
+    session: {
+      model: "gpt-realtime",
+      type: "realtime"
+    },
+    sessionEndpoint: "http://localhost/realtime/session"
+  });
+
+  const starts: ToolCallStart[] = [];
+  const chunks: string[] = [];
+  let completed = false;
+
+  client.toolCallStarts$.subscribe((start) => {
+    starts.push(start);
+    start.argumentChunks$.subscribe({
+      complete: () => {
+        completed = true;
+      },
+      next: (chunk) => {
+        chunks.push(chunk);
+      }
+    });
+  });
+
+  const connectPromise = client.connect();
+  const channel = peer.createdChannels.at(0);
+  if (channel === undefined) {
+    throw new Error("Expected data channel to be created.");
+  }
+  channel.open();
+  await connectPromise;
+
+  // Act
+  channel.emitMessage({
+    arguments: '{"city":"San Francisco"}',
+    call_id: "call_done_only",
+    item_id: "fc_done_only",
+    response_id: "resp_done_only",
+    type: "response.function_call_arguments.done"
+  });
+
+  // Assert
+  expect(starts).toHaveLength(1);
+  expect(starts[0]?.callId).toBe("call_done_only");
+  expect(chunks).toEqual(['{"city":"San Francisco"}']);
+  expect(completed).toBe(true);
+});
+
 test("send before open emits client error event", () => {
   // Arrange
   const client = createRealtimeClient({
@@ -744,6 +798,31 @@ test("parseCoreServerEvent normalizes response.output_item.done without optional
   });
 });
 
+test("parseCoreServerEvent normalizes non-string done arguments", () => {
+  // Arrange
+  const rawEvent = {
+    arguments: {
+      orderId: "abc123"
+    },
+    call_id: "call_non_string_done_args",
+    type: "response.function_call_arguments.done"
+  };
+
+  // Act
+  const parsed = parseCoreServerEvent(rawEvent);
+
+  // Assert
+  expect(isFunctionCallArgumentsDoneEvent(parsed)).toBe(true);
+  if (!isFunctionCallArgumentsDoneEvent(parsed)) {
+    throw new Error("Expected function-call done event.");
+  }
+  expect(parsed).toEqual({
+    arguments: '{"orderId":"abc123"}',
+    call_id: "call_non_string_done_args",
+    type: "response.function_call_arguments.done"
+  });
+});
+
 test("parseCoreServerEvent parses error envelopes as ErrorEvent", () => {
   // Arrange
   const rawEvent = {
@@ -816,6 +895,405 @@ test("done event is enriched with tool name from output_item.added metadata", as
 
   // Assert
   expect(doneNames).toEqual(["render_ui"]);
+});
+
+test("response.done emits normalized function-call done events", async () => {
+  // Arrange
+  const peer = new FakePeerConnection();
+  const client = createRealtimeClient({
+    fetchImpl: () =>
+      Promise.resolve(new Response("answer-sdp", { status: 200 })),
+    peerConnectionFactory: () => peer,
+    session: {
+      model: "gpt-realtime",
+      type: "realtime"
+    },
+    sessionEndpoint: "http://localhost/realtime/session"
+  });
+
+  const doneEvents: Array<{
+    arguments: string;
+    callId: string;
+    name?: string;
+    responseId?: string;
+  }> = [];
+  client.events$.subscribe((event) => {
+    if (!isFunctionCallArgumentsDoneEvent(event)) {
+      return;
+    }
+
+    doneEvents.push({
+      arguments: event.arguments,
+      callId: event.call_id,
+      ...(event.name === undefined ? {} : { name: event.name }),
+      ...(event.response_id === undefined
+        ? {}
+        : { responseId: event.response_id })
+    });
+  });
+
+  const starts: ToolCallStart[] = [];
+  const chunks: string[] = [];
+  client.toolCallStarts$.subscribe((start) => {
+    starts.push(start);
+    start.argumentChunks$.subscribe((chunk) => {
+      chunks.push(chunk);
+    });
+  });
+
+  const connectPromise = client.connect();
+  const channel = peer.createdChannels.at(0);
+  if (channel === undefined) {
+    throw new Error("Expected data channel to be created.");
+  }
+  channel.open();
+  await connectPromise;
+
+  // Act
+  channel.emitMessage({
+    response: {
+      id: "resp_done",
+      output: [
+        {
+          arguments: '{"orderId":"abc123"}',
+          call_id: "call_from_response_done",
+          name: "lookup_order_eta",
+          type: "function_call"
+        }
+      ]
+    },
+    type: "response.done"
+  });
+
+  // Assert
+  expect(doneEvents).toEqual([
+    {
+      arguments: '{"orderId":"abc123"}',
+      callId: "call_from_response_done",
+      name: "lookup_order_eta",
+      responseId: "resp_done"
+    }
+  ]);
+  expect(starts).toHaveLength(1);
+  expect(starts[0]?.callId).toBe("call_from_response_done");
+  expect(chunks).toEqual(['{"orderId":"abc123"}']);
+});
+
+test("response.done synthesizes done events when arguments are structured JSON values", async () => {
+  // Arrange
+  const peer = new FakePeerConnection();
+  const client = createRealtimeClient({
+    fetchImpl: () =>
+      Promise.resolve(new Response("answer-sdp", { status: 200 })),
+    peerConnectionFactory: () => peer,
+    session: {
+      model: "gpt-realtime",
+      type: "realtime"
+    },
+    sessionEndpoint: "http://localhost/realtime/session"
+  });
+
+  const doneEvents: Array<{ arguments: string; callId: string }> = [];
+  client.events$.subscribe((event) => {
+    if (!isFunctionCallArgumentsDoneEvent(event)) {
+      return;
+    }
+
+    doneEvents.push({
+      arguments: event.arguments,
+      callId: event.call_id
+    });
+  });
+
+  const connectPromise = client.connect();
+  const channel = peer.createdChannels.at(0);
+  if (channel === undefined) {
+    throw new Error("Expected data channel to be created.");
+  }
+  channel.open();
+  await connectPromise;
+
+  // Act
+  channel.emitMessage({
+    response: {
+      output: [
+        {
+          arguments: {
+            orderId: "abc123"
+          },
+          call_id: "call_structured_args",
+          type: "function_call"
+        }
+      ]
+    },
+    type: "response.done"
+  });
+
+  // Assert
+  expect(doneEvents).toContainEqual({
+    arguments: '{"orderId":"abc123"}',
+    callId: "call_structured_args"
+  });
+});
+
+test("response.done done events are enriched by prior output-item metadata", async () => {
+  // Arrange
+  const peer = new FakePeerConnection();
+  const client = createRealtimeClient({
+    fetchImpl: () =>
+      Promise.resolve(new Response("answer-sdp", { status: 200 })),
+    peerConnectionFactory: () => peer,
+    session: {
+      model: "gpt-realtime",
+      type: "realtime"
+    },
+    sessionEndpoint: "http://localhost/realtime/session"
+  });
+
+  const doneNames: string[] = [];
+  client.events$.subscribe((event) => {
+    if (isFunctionCallArgumentsDoneEvent(event) && event.name !== undefined) {
+      doneNames.push(event.name);
+    }
+  });
+
+  const connectPromise = client.connect();
+  const channel = peer.createdChannels.at(0);
+  if (channel === undefined) {
+    throw new Error("Expected data channel to be created.");
+  }
+  channel.open();
+  await connectPromise;
+
+  // Act
+  channel.emitMessage({
+    item: {
+      call_id: "call_meta_response_done",
+      name: "render_ui",
+      type: "function_call"
+    },
+    type: "response.output_item.added"
+  });
+  channel.emitMessage({
+    response: {
+      output: [
+        {
+          arguments: '{"ui":[]}',
+          call_id: "call_meta_response_done",
+          type: "function_call"
+        }
+      ]
+    },
+    type: "response.done"
+  });
+
+  // Assert
+  expect(doneNames).toContain("render_ui");
+});
+
+test("response.output_item.done synthesizes done from accumulated deltas when item arguments are missing", async () => {
+  // Arrange
+  const peer = new FakePeerConnection();
+  const client = createRealtimeClient({
+    fetchImpl: () =>
+      Promise.resolve(new Response("answer-sdp", { status: 200 })),
+    peerConnectionFactory: () => peer,
+    session: {
+      model: "gpt-realtime",
+      type: "realtime"
+    },
+    sessionEndpoint: "http://localhost/realtime/session"
+  });
+
+  const doneEvents: Array<{
+    arguments: string;
+    callId: string;
+    name?: string;
+  }> = [];
+  client.events$.subscribe((event) => {
+    if (!isFunctionCallArgumentsDoneEvent(event)) {
+      return;
+    }
+
+    doneEvents.push({
+      arguments: event.arguments,
+      callId: event.call_id,
+      ...(event.name === undefined ? {} : { name: event.name })
+    });
+  });
+
+  const starts: ToolCallStart[] = [];
+  const chunks: string[] = [];
+  let completed = false;
+  client.toolCallStarts$.subscribe((start) => {
+    starts.push(start);
+    start.argumentChunks$.subscribe({
+      complete: () => {
+        completed = true;
+      },
+      next: (chunk) => {
+        chunks.push(chunk);
+      }
+    });
+  });
+
+  const connectPromise = client.connect();
+  const channel = peer.createdChannels.at(0);
+  if (channel === undefined) {
+    throw new Error("Expected data channel to be created.");
+  }
+  channel.open();
+  await connectPromise;
+
+  // Act
+  channel.emitMessage({
+    item: {
+      call_id: "call_output_item_done_missing_args",
+      name: "lookup_order_eta",
+      type: "function_call"
+    },
+    type: "response.output_item.added"
+  });
+  channel.emitMessage({
+    call_id: "call_output_item_done_missing_args",
+    delta: '{"orderId":"abc123"}',
+    type: "response.function_call_arguments.delta"
+  });
+  channel.emitMessage({
+    item: {
+      call_id: "call_output_item_done_missing_args",
+      name: "lookup_order_eta",
+      type: "function_call"
+    },
+    type: "response.output_item.done"
+  });
+
+  // Assert
+  expect(doneEvents).toContainEqual({
+    arguments: '{"orderId":"abc123"}',
+    callId: "call_output_item_done_missing_args",
+    name: "lookup_order_eta"
+  });
+  expect(starts).toHaveLength(1);
+  expect(chunks).toEqual(['{"orderId":"abc123"}']);
+  expect(completed).toBe(true);
+});
+
+test("conversation.item.done synthesizes function-call done event", async () => {
+  // Arrange
+  const peer = new FakePeerConnection();
+  const client = createRealtimeClient({
+    fetchImpl: () =>
+      Promise.resolve(new Response("answer-sdp", { status: 200 })),
+    peerConnectionFactory: () => peer,
+    session: {
+      model: "gpt-realtime",
+      type: "realtime"
+    },
+    sessionEndpoint: "http://localhost/realtime/session"
+  });
+
+  const doneEvents: Array<{
+    arguments: string;
+    callId: string;
+    name?: string;
+  }> = [];
+  client.events$.subscribe((event) => {
+    if (!isFunctionCallArgumentsDoneEvent(event)) {
+      return;
+    }
+
+    doneEvents.push({
+      arguments: event.arguments,
+      callId: event.call_id,
+      ...(event.name === undefined ? {} : { name: event.name })
+    });
+  });
+
+  const connectPromise = client.connect();
+  const channel = peer.createdChannels.at(0);
+  if (channel === undefined) {
+    throw new Error("Expected data channel to be created.");
+  }
+  channel.open();
+  await connectPromise;
+
+  // Act
+  channel.emitMessage({
+    item: {
+      arguments: '{"ui":[]}',
+      call_id: "call_from_conversation_item_done",
+      name: "render_ui",
+      type: "function_call"
+    },
+    type: "conversation.item.done"
+  });
+
+  // Assert
+  expect(doneEvents).toContainEqual({
+    arguments: '{"ui":[]}',
+    callId: "call_from_conversation_item_done",
+    name: "render_ui"
+  });
+});
+
+test("conversation.item.added synthesizes done for completed function-call items", async () => {
+  // Arrange
+  const peer = new FakePeerConnection();
+  const client = createRealtimeClient({
+    fetchImpl: () =>
+      Promise.resolve(new Response("answer-sdp", { status: 200 })),
+    peerConnectionFactory: () => peer,
+    session: {
+      model: "gpt-realtime",
+      type: "realtime"
+    },
+    sessionEndpoint: "http://localhost/realtime/session"
+  });
+
+  const doneEvents: Array<{
+    arguments: string;
+    callId: string;
+    name?: string;
+  }> = [];
+  client.events$.subscribe((event) => {
+    if (!isFunctionCallArgumentsDoneEvent(event)) {
+      return;
+    }
+
+    doneEvents.push({
+      arguments: event.arguments,
+      callId: event.call_id,
+      ...(event.name === undefined ? {} : { name: event.name })
+    });
+  });
+
+  const connectPromise = client.connect();
+  const channel = peer.createdChannels.at(0);
+  if (channel === undefined) {
+    throw new Error("Expected data channel to be created.");
+  }
+  channel.open();
+  await connectPromise;
+
+  // Act
+  channel.emitMessage({
+    item: {
+      arguments: '{"orderId":"abc123"}',
+      call_id: "call_from_conversation_item_added",
+      name: "lookup_order_eta",
+      status: "completed",
+      type: "function_call"
+    },
+    type: "conversation.item.added"
+  });
+
+  // Assert
+  expect(doneEvents).toContainEqual({
+    arguments: '{"orderId":"abc123"}',
+    callId: "call_from_conversation_item_added",
+    name: "lookup_order_eta"
+  });
 });
 
 test("parse helpers reject invalid payload shapes", () => {

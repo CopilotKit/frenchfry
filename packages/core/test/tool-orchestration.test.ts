@@ -6,6 +6,7 @@ import {
   createToolRegistry,
   reduceToolCallAccumulatorState,
   runToolInvocation,
+  shouldInvokeToolCall,
   type OrchestrationTool
 } from "../src/tool-orchestration";
 
@@ -257,6 +258,96 @@ test("accumulator returns original state for unrelated events", () => {
 
   // Assert
   expect(next).toBe(initial);
+});
+
+test("shouldInvokeToolCall returns true when call has not been marked done", () => {
+  // Arrange
+  const state = createToolCallAccumulatorState();
+
+  // Act
+  const result = shouldInvokeToolCall(state, {
+    arguments: '{"ok":true}',
+    call_id: "call_new",
+    type: "response.function_call_arguments.done"
+  });
+
+  // Assert
+  expect(result).toBe(true);
+});
+
+test("shouldInvokeToolCall returns false for duplicate done arguments", () => {
+  // Arrange
+  const state = reduceToolCallAccumulatorState(
+    createToolCallAccumulatorState(),
+    {
+      arguments: '{"ok":true}',
+      call_id: "call_duplicate",
+      type: "response.function_call_arguments.done"
+    },
+    1
+  );
+
+  // Act
+  const result = shouldInvokeToolCall(state, {
+    arguments: '{"ok":true}',
+    call_id: "call_duplicate",
+    type: "response.function_call_arguments.done"
+  });
+
+  // Assert
+  expect(result).toBe(false);
+});
+
+test("shouldInvokeToolCall returns true when duplicate done adds missing name", () => {
+  // Arrange
+  const state = reduceToolCallAccumulatorState(
+    createToolCallAccumulatorState(),
+    {
+      arguments: '{"ok":true}',
+      call_id: "call_upgrade",
+      type: "response.function_call_arguments.done"
+    },
+    1
+  );
+
+  // Act
+  const result = shouldInvokeToolCall(state, {
+    arguments: '{"ok":true}',
+    call_id: "call_upgrade",
+    name: "render_ui",
+    type: "response.function_call_arguments.done"
+  });
+
+  // Assert
+  expect(result).toBe(true);
+});
+
+test("reduceDone preserves previous name when done event omits it", () => {
+  // Arrange
+  const initialWithName = reduceToolCallAccumulatorState(
+    createToolCallAccumulatorState(),
+    {
+      arguments: '{"ok":true}',
+      call_id: "call_name",
+      name: "lookup_order_eta",
+      type: "response.function_call_arguments.done"
+    },
+    1
+  );
+
+  // Act
+  const next = reduceToolCallAccumulatorState(
+    initialWithName,
+    {
+      arguments: '{"ok":true}',
+      call_id: "call_name",
+      type: "response.function_call_arguments.done"
+    },
+    2
+  );
+
+  // Assert
+  expect(next.callsById.call_name?.name).toBe("lookup_order_eta");
 });
 
 test("runToolInvocation returns unknown_tool when no tool exists", async () => {

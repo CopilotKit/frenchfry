@@ -42,7 +42,7 @@ const functionCallArgumentsDeltaEventSchema = z.object({
 });
 
 const functionCallArgumentsDoneEventSchema = z.object({
-  arguments: z.string(),
+  arguments: jsonValueSchema,
   call_id: z.string(),
   event_id: z.string().optional(),
   item_id: z.string().optional(),
@@ -55,7 +55,7 @@ const functionCallArgumentsDoneEventSchema = z.object({
 const outputItemDoneFunctionCallEventSchema = z.object({
   item: z
     .object({
-      arguments: z.string(),
+      arguments: jsonValueSchema,
       call_id: z.string(),
       id: z.string().optional(),
       name: z.string().optional(),
@@ -95,15 +95,32 @@ export const parseCoreServerEvent = (rawEvent: unknown): CoreServerEvent => {
   const doneResult = functionCallArgumentsDoneEventSchema.safeParse(rawEvent);
 
   if (doneResult.success) {
-    return doneResult.data;
+    const serializedArguments = serializeJsonValue(doneResult.data.arguments);
+    if (serializedArguments === null) {
+      throw new Error("Function call done event arguments were not serializable.");
+    }
+
+    return {
+      ...doneResult.data,
+      arguments: serializedArguments
+    };
   }
 
   const outputItemDoneResult =
     outputItemDoneFunctionCallEventSchema.safeParse(rawEvent);
 
   if (outputItemDoneResult.success) {
+    const serializedArguments = serializeJsonValue(
+      outputItemDoneResult.data.item.arguments
+    );
+    if (serializedArguments === null) {
+      throw new Error(
+        "Function call output-item done arguments were not serializable."
+      );
+    }
+
     return {
-      arguments: outputItemDoneResult.data.item.arguments,
+      arguments: serializedArguments,
       call_id: outputItemDoneResult.data.item.call_id,
       ...(outputItemDoneResult.data.item.id === undefined
         ? {}
@@ -161,7 +178,11 @@ export const parseCoreClientEvent = (rawEvent: unknown): CoreClientEvent => {
 export const isFunctionCallArgumentsDeltaEvent = (
   event: CoreServerEvent
 ): event is FunctionCallArgumentsDeltaEvent => {
-  return event.type === "response.function_call_arguments.delta";
+  return (
+    event.type === "response.function_call_arguments.delta" &&
+    typeof event.call_id === "string" &&
+    typeof event.delta === "string"
+  );
 };
 
 /**
@@ -173,7 +194,11 @@ export const isFunctionCallArgumentsDeltaEvent = (
 export const isFunctionCallArgumentsDoneEvent = (
   event: CoreServerEvent
 ): event is FunctionCallArgumentsDoneEvent => {
-  return event.type === "response.function_call_arguments.done";
+  return (
+    event.type === "response.function_call_arguments.done" &&
+    typeof event.call_id === "string" &&
+    typeof event.arguments === "string"
+  );
 };
 
 /**
@@ -196,4 +221,22 @@ export const toUnknownServerEvent = (
   event: CoreServerEvent
 ): UnknownServerEvent => {
   return event;
+};
+
+/**
+ * Serializes JSON values into stable argument strings for downstream tool parsing.
+ *
+ * @param value JSON value from server event payload.
+ * @returns Serialized JSON string, or `null` when serialization fails.
+ */
+const serializeJsonValue = (value: unknown): string | null => {
+  if (typeof value === "string") {
+    return value;
+  }
+
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return null;
+  }
 };

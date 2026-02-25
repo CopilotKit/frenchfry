@@ -8,7 +8,8 @@ export {
   createToolCallAccumulatorState,
   createToolRegistry,
   reduceToolCallAccumulatorState,
-  runToolInvocation
+  runToolInvocation,
+  shouldInvokeToolCall
 } from "./tool-orchestration";
 
 export {

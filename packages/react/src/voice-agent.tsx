@@ -9,6 +9,7 @@ import {
   isFunctionCallArgumentsDoneEvent,
   reduceToolCallAccumulatorState,
   runToolInvocation,
+  shouldInvokeToolCall,
   type CoreClientEvent,
   type CoreServerEvent,
   type ErrorEvent,
@@ -65,6 +66,9 @@ type SessionToolDefinition = {
  */
 export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
   const toolTimeoutMs = props.toolTimeoutMs ?? 15000;
+  const sessionSignature = useMemo(() => {
+    return JSON.stringify(props.session);
+  }, [props.session]);
   const genUiSessionTools = useMemo<readonly SessionToolDefinition[]>(() => {
     return props.genUi?.map((registration) => registration.sessionTool) ?? [];
   }, [props.genUi]);
@@ -80,7 +84,7 @@ export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
       session: props.session,
       sessionEndpoint: props.sessionEndpoint
     });
-  }, [props.session, props.sessionEndpoint]);
+  }, [props.sessionEndpoint, sessionSignature]);
 
   const toolRegistry = useMemo(() => {
     return createToolRegistry([
@@ -92,6 +96,14 @@ export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
   const accumulatorStateRef = useRef<ToolCallAccumulatorState>(
     createToolCallAccumulatorState()
   );
+  const toolNameByCallIdRef = useRef<Map<string, string>>(new Map());
+  const genUiRegistrationsRef = useRef<readonly GenUiRegistration[] | undefined>(
+    props.genUi
+  );
+
+  useEffect(() => {
+    genUiRegistrationsRef.current = props.genUi;
+  }, [props.genUi]);
 
   const [activeCallsById, setActiveCallsById] = useState<
     Readonly<Record<string, ActiveToolCallState>>
@@ -144,6 +156,8 @@ export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
         if (existing?.status === "running") {
           return previous;
         }
+        const resolvedName =
+          entry.name ?? toolNameByCallIdRef.current.get(callId);
 
         return {
           ...previous,
@@ -151,7 +165,7 @@ export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
             argumentText: entry.argumentText,
             callId: entry.callId,
             itemId: entry.itemId,
-            ...(entry.name === undefined ? {} : { name: entry.name }),
+            ...(resolvedName === undefined ? {} : { name: resolvedName }),
             responseId: entry.responseId,
             status: "streaming",
             updatedAtMs
@@ -288,6 +302,7 @@ export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
         delete remaining[event.call_id];
         return remaining;
       });
+      toolNameByCallIdRef.current.delete(event.call_id);
     },
     [sendEvents, toolRegistry, toolTimeoutMs]
   );
@@ -297,11 +312,22 @@ export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
 
     subscription.add(
       realtimeClient.toolCallStarts$.subscribe((start) => {
-        props.genUi?.forEach((registration) => {
+        genUiRegistrationsRef.current?.forEach((registration) => {
           registration.onToolCallStart({
             callId: start.callId
           });
         });
+
+        subscription.add(
+          start.argumentChunks$.subscribe((delta) => {
+            genUiRegistrationsRef.current?.forEach((registration) => {
+              registration.onToolCallDelta({
+                callId: start.callId,
+                delta
+              });
+            });
+          })
+        );
       })
     );
 
@@ -325,6 +351,9 @@ export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
     subscription.add(
       realtimeClient.events$.subscribe((event) => {
         const updatedAtMs = Date.now();
+        const shouldExecuteDoneEvent = isFunctionCallArgumentsDoneEvent(event)
+          ? shouldInvokeToolCall(accumulatorStateRef.current, event)
+          : false;
 
         applyAccumulatorEvent(updatedAtMs, event);
 
@@ -334,6 +363,7 @@ export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
         }
 
         if (event.type === "runtime.connection.closed") {
+          toolNameByCallIdRef.current.clear();
           setVoiceInputStatus("idle");
           setStatus("idle");
           return;
@@ -344,18 +374,37 @@ export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
           return;
         }
 
-        if (isFunctionCallArgumentsDeltaEvent(event)) {
-          props.genUi?.forEach((registration) => {
-            registration.onToolCallDelta({
-              callId: event.call_id,
-              delta: event.delta
-            });
+        const metadata = extractFunctionCallMetadata(event);
+        if (metadata !== null) {
+          toolNameByCallIdRef.current.set(metadata.callId, metadata.name);
+          setActiveCallsById((previous) => {
+            const existing = previous[metadata.callId];
+            if (existing === undefined || existing.name === metadata.name) {
+              return previous;
+            }
+
+            return {
+              ...previous,
+              [metadata.callId]: {
+                ...existing,
+                name: metadata.name
+              }
+            };
           });
           return;
         }
 
         if (isFunctionCallArgumentsDoneEvent(event)) {
-          props.genUi?.forEach((registration) => {
+          debugToolLoopReact("done event observed", {
+            callId: event.call_id,
+            name: event.name,
+            shouldExecute: shouldExecuteDoneEvent
+          });
+          if (!shouldExecuteDoneEvent) {
+            return;
+          }
+
+          genUiRegistrationsRef.current?.forEach((registration) => {
             registration.onToolCallDone(
               event.name === undefined
                 ? {
@@ -369,7 +418,46 @@ export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
           });
 
           void executeToolCall(event);
+          return;
         }
+
+        const outputItemDoneEvent = toDoneEventFromOutputItemDone(
+          event,
+          accumulatorStateRef.current,
+          toolNameByCallIdRef.current
+        );
+        if (outputItemDoneEvent === null) {
+          return;
+        }
+
+        const shouldExecuteOutputItemDone = shouldInvokeToolCall(
+          accumulatorStateRef.current,
+          outputItemDoneEvent
+        );
+        applyAccumulatorEvent(updatedAtMs, outputItemDoneEvent);
+        debugToolLoopReact("output_item.done mapped to done", {
+          callId: outputItemDoneEvent.call_id,
+          name: outputItemDoneEvent.name,
+          shouldExecute: shouldExecuteOutputItemDone
+        });
+        if (!shouldExecuteOutputItemDone) {
+          return;
+        }
+
+        genUiRegistrationsRef.current?.forEach((registration) => {
+          registration.onToolCallDone(
+            outputItemDoneEvent.name === undefined
+              ? {
+                  callId: outputItemDoneEvent.call_id
+                }
+              : {
+                  callId: outputItemDoneEvent.call_id,
+                  name: outputItemDoneEvent.name
+                }
+          );
+        });
+
+        void executeToolCall(outputItemDoneEvent);
       })
     );
 
@@ -380,7 +468,6 @@ export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
     applyAccumulatorEvent,
     ensureRemoteAudioElement,
     executeToolCall,
-    props.genUi,
     realtimeClient
   ]);
 
@@ -455,6 +542,7 @@ export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
     realtimeClient.disconnect();
     setActiveCallsById({});
     accumulatorStateRef.current = createToolCallAccumulatorState();
+    toolNameByCallIdRef.current.clear();
     setStatus("idle");
   }, [realtimeClient, stopVoiceInput]);
 
@@ -615,4 +703,164 @@ const toErrorMessage = (error: unknown): string => {
   }
 
   return "Unknown error";
+};
+
+/**
+ * Extracts function-call metadata from pass-through output-item-added events.
+ *
+ * @param event Parsed core server event.
+ * @returns Call metadata when event contains function-call name and call id.
+ */
+const extractFunctionCallMetadata = (
+  event: CoreServerEvent
+): { callId: string; name: string } | null => {
+  if (event.type !== "response.output_item.added") {
+    return null;
+  }
+
+  const item = event.item;
+  if (typeof item !== "object" || item === null) {
+    return null;
+  }
+
+  if (!("type" in item) || item.type !== "function_call") {
+    return null;
+  }
+
+  if (!("call_id" in item) || typeof item.call_id !== "string") {
+    return null;
+  }
+
+  if (!("name" in item) || typeof item.name !== "string") {
+    return null;
+  }
+
+  return {
+    callId: item.call_id,
+    name: item.name
+  };
+};
+
+/**
+ * Creates a done event from `response.output_item.done` when possible.
+ *
+ * @param event Parsed core server event.
+ * @param accumulatorState Current tool-call accumulator state.
+ * @param toolNameByCallId Known call-id to tool-name mapping.
+ * @returns Done event for invocation, or `null` when event does not contain usable completion metadata.
+ */
+const toDoneEventFromOutputItemDone = (
+  event: CoreServerEvent,
+  accumulatorState: ToolCallAccumulatorState,
+  toolNameByCallId: ReadonlyMap<string, string>
+): FunctionCallArgumentsDoneEvent | null => {
+  if (event.type !== "response.output_item.done") {
+    return null;
+  }
+
+  const item = event.item;
+  if (typeof item !== "object" || item === null) {
+    return null;
+  }
+
+  if (!("type" in item) || item.type !== "function_call") {
+    return null;
+  }
+
+  if (!("call_id" in item) || typeof item.call_id !== "string") {
+    return null;
+  }
+
+  const accumulatorEntry = accumulatorState.callsById[item.call_id];
+  const argumentsText = resolveOutputItemDoneArguments(item, accumulatorEntry);
+  if (argumentsText === null) {
+    return null;
+  }
+
+  const itemName =
+    "name" in item && typeof item.name === "string" ? item.name : undefined;
+  const resolvedName =
+    itemName ?? accumulatorEntry?.name ?? toolNameByCallId.get(item.call_id);
+
+  return {
+    arguments: argumentsText,
+    call_id: item.call_id,
+    ...(accumulatorEntry?.itemId === undefined
+      ? {}
+      : { item_id: accumulatorEntry.itemId }),
+    ...(resolvedName === undefined ? {} : { name: resolvedName }),
+    ...(accumulatorEntry?.responseId === undefined
+      ? {}
+      : { response_id: accumulatorEntry.responseId }),
+    type: "response.function_call_arguments.done"
+  };
+};
+
+/**
+ * Resolves argument text from an output-item done payload or prior accumulated deltas.
+ *
+ * @param item Output item object from event payload.
+ * @param accumulatorEntry Existing accumulator entry for the call id.
+ * @returns Serialized argument text, or `null` when no arguments are available.
+ */
+const resolveOutputItemDoneArguments = (
+  item: Readonly<Record<string, unknown>>,
+  accumulatorEntry: ToolCallAccumulatorState["callsById"][string] | undefined
+): string | null => {
+  const rawArguments = "arguments" in item ? item.arguments : undefined;
+  if (typeof rawArguments === "string") {
+    return rawArguments;
+  }
+
+  if (rawArguments !== undefined) {
+    try {
+      return JSON.stringify(rawArguments);
+    } catch {
+      return null;
+    }
+  }
+
+  if (accumulatorEntry === undefined) {
+    return null;
+  }
+
+  return accumulatorEntry.argumentText;
+};
+
+/**
+ * Emits debug logs for React-side tool-loop decisions when enabled.
+ *
+ * @param message Log message.
+ * @param payload Optional structured payload.
+ */
+const debugToolLoopReact = (
+  message: string,
+  payload?: Readonly<Record<string, unknown>>
+): void => {
+  if (payload === undefined) {
+    console.log("[frenchfry:react:tool-loop]", message);
+    return;
+  }
+
+  console.log(
+    "[frenchfry:react:tool-loop]",
+    message,
+    serializeDebugPayload(payload)
+  );
+};
+
+/**
+ * Safely serializes debug payloads for copy/paste logging.
+ *
+ * @param payload Debug payload object.
+ * @returns JSON string representation.
+ */
+const serializeDebugPayload = (
+  payload: Readonly<Record<string, unknown>>
+): string => {
+  try {
+    return JSON.stringify(payload);
+  } catch {
+    return '{"serialization_error":true}';
+  }
 };

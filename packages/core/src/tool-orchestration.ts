@@ -236,6 +236,34 @@ export const runToolInvocation = async (
 };
 
 /**
+ * Determines whether a done event should trigger a tool execution for a call id.
+ *
+ * @param state Current tool-call accumulator state.
+ * @param event Done event candidate.
+ * @returns True when invocation should run for this done event.
+ */
+export const shouldInvokeToolCall = (
+  state: ToolCallAccumulatorState,
+  event: FunctionCallArgumentsDoneEvent
+): boolean => {
+  const existing = state.callsById[event.call_id];
+
+  if (existing === undefined) {
+    return true;
+  }
+
+  if (!existing.isDone) {
+    return true;
+  }
+
+  if (existing.name === undefined && event.name !== undefined) {
+    return true;
+  }
+
+  return existing.doneArguments !== event.arguments;
+};
+
+/**
  * Creates OpenAI-compatible client events for a function-call output payload.
  *
  * @param input Output envelope details.
@@ -332,7 +360,11 @@ const reduceDone = (
   };
   const next: ToolCallAccumulatorEntry = {
     ...nextBase,
-    ...(event.name === undefined ? {} : { name: event.name })
+    ...(event.name === undefined
+      ? previous?.name === undefined
+        ? {}
+        : { name: previous.name }
+      : { name: event.name })
   };
 
   return {
