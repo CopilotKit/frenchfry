@@ -5,50 +5,55 @@ import {
   useGenUi,
   useTool,
   useUiKit,
-  useVoiceAgent,
-  type FrenchfryWarning
+  useVoiceAgent
 } from "@frenchfryai/react";
 import { s } from "@hashbrownai/core";
 import { exposeComponent } from "@hashbrownai/react";
-import {
-  type ReactElement,
-  useCallback,
-  useEffect,
-  useMemo,
-  useState
-} from "react";
-import { z } from "zod";
+import { type ReactElement } from "react";
 
 import "./app.css";
 
-type LogEntry = {
-  id: string;
-  level: "error" | "info";
-  message: string;
-  timestamp: string;
+type StatusTone = "critical" | "healthy" | "watch";
+
+const runtimeUrl = "http://localhost:8787";
+const generatedUiOutlet = "voice-main";
+
+/**
+ * Determines whether a runtime value is a plain object map.
+ *
+ * @param value Runtime value.
+ * @returns True when value is a plain object map.
+ */
+const isRecord = (value: unknown): value is Record<string, unknown> => {
+  return typeof value === "object" && value !== null;
 };
 
-const statusPillPropsSchema = z.object({
-  label: z.string(),
-  tone: z.enum(["critical", "healthy", "watch"])
-});
+/**
+ * Reads a string property from a plain object.
+ *
+ * @param value Candidate object value.
+ * @param key Property key.
+ * @returns String property value when present.
+ */
+const readString = (
+  value: Record<string, unknown>,
+  key: string
+): string | undefined => {
+  const candidate = value[key];
+  return typeof candidate === "string" ? candidate : undefined;
+};
 
-const statCardPropsSchema = z.object({
-  label: z.string(),
-  tone: z.enum(["critical", "healthy", "watch"]),
-  value: z.string()
-});
-
-const taskListPropsSchema = z.object({
-  items: z.array(z.string()),
-  title: z.string()
-});
-
-const demoServerConfigSchema = z.object({
-  realtimeSessionUrl: z.string().url()
-});
-
-const defaultServerHttpUrl = "http://localhost:8787";
+/**
+ * Parses a status tone value from an unknown input.
+ *
+ * @param value Runtime value.
+ * @returns Status tone when valid.
+ */
+const toStatusTone = (value: unknown): StatusTone | undefined => {
+  return value === "critical" || value === "healthy" || value === "watch"
+    ? value
+    : undefined;
+};
 
 /**
  * Renders a compact status badge for generated UI.
@@ -57,17 +62,18 @@ const defaultServerHttpUrl = "http://localhost:8787";
  * @returns Styled badge element.
  */
 const StatusPill = (props: unknown): ReactElement => {
-  const parsed = statusPillPropsSchema.safeParse(props);
-  if (!parsed.success) {
-    return (
-      <span className="status-pill tone-watch">Invalid StatusPill props</span>
-    );
+  if (!isRecord(props)) {
+    return <span className="status-pill tone-watch">Invalid StatusPill props</span>;
+  }
+
+  const label = readString(props, "label");
+  const tone = toStatusTone(props.tone);
+  if (label === undefined || tone === undefined) {
+    return <span className="status-pill tone-watch">Invalid StatusPill props</span>;
   }
 
   return (
-    <span className={`status-pill tone-${parsed.data.tone}`}>
-      {parsed.data.label}
-    </span>
+    <span className={`status-pill tone-${tone}`}>{label}</span>
   );
 };
 
@@ -78,8 +84,18 @@ const StatusPill = (props: unknown): ReactElement => {
  * @returns Metric card element.
  */
 const StatCard = (props: unknown): ReactElement => {
-  const parsed = statCardPropsSchema.safeParse(props);
-  if (!parsed.success) {
+  if (!isRecord(props)) {
+    return (
+      <article className="stat-card tone-watch">
+        <p className="stat-label">Invalid StatCard props</p>
+      </article>
+    );
+  }
+
+  const label = readString(props, "label");
+  const tone = toStatusTone(props.tone);
+  const value = readString(props, "value");
+  if (label === undefined || tone === undefined || value === undefined) {
     return (
       <article className="stat-card tone-watch">
         <p className="stat-label">Invalid StatCard props</p>
@@ -88,9 +104,9 @@ const StatCard = (props: unknown): ReactElement => {
   }
 
   return (
-    <article className={`stat-card tone-${parsed.data.tone}`}>
-      <p className="stat-label">{parsed.data.label}</p>
-      <p className="stat-value">{parsed.data.value}</p>
+    <article className={`stat-card tone-${tone}`}>
+      <p className="stat-label">{label}</p>
+      <p className="stat-value">{value}</p>
     </article>
   );
 };
@@ -102,8 +118,20 @@ const StatCard = (props: unknown): ReactElement => {
  * @returns Task list element.
  */
 const TaskList = (props: unknown): ReactElement => {
-  const parsed = taskListPropsSchema.safeParse(props);
-  if (!parsed.success) {
+  if (!isRecord(props)) {
+    return (
+      <section className="task-list">
+        <h3>Invalid TaskList props</h3>
+      </section>
+    );
+  }
+
+  const title = readString(props, "title");
+  const items =
+    Array.isArray(props.items) && props.items.every((item) => typeof item === "string")
+      ? props.items
+      : undefined;
+  if (title === undefined || items === undefined) {
     return (
       <section className="task-list">
         <h3>Invalid TaskList props</h3>
@@ -113,9 +141,9 @@ const TaskList = (props: unknown): ReactElement => {
 
   return (
     <section className="task-list">
-      <h3>{parsed.data.title}</h3>
+      <h3>{title}</h3>
       <ul>
-        {parsed.data.items.map((item) => {
+        {items.map((item) => {
           return <li key={item}>{item}</li>;
         })}
       </ul>
@@ -123,103 +151,33 @@ const TaskList = (props: unknown): ReactElement => {
   );
 };
 
-/**
- * Fetches and validates runtime session configuration from the demo server.
- *
- * @param serverHttpUrl HTTP URL of the demo server.
- * @returns Loading, error, and resolved session URL state.
- */
-const useDemoServerConfig = (
-  serverHttpUrl: string
-): {
-  error?: string;
-  isLoading: boolean;
-  realtimeSessionUrl?: string;
-} => {
-  const [state, setState] = useState<{
-    error?: string;
-    isLoading: boolean;
-    realtimeSessionUrl?: string;
-  }>({
-    isLoading: true
-  });
+const statusPillComponent = exposeComponent(StatusPill, {
+  description: "Displays a concise service health badge.",
+  name: "StatusPill",
+  props: {
+    label: s.string("Short status label."),
+    tone: s.enumeration("Visual severity tone.", ["critical", "healthy", "watch"])
+  }
+});
 
-  useEffect(() => {
-    const abortController = new AbortController();
-    setState({
-      isLoading: true
-    });
+const statCardComponent = exposeComponent(StatCard, {
+  description: "Displays a metric label and value card.",
+  name: "StatCard",
+  props: {
+    label: s.string("Metric label."),
+    tone: s.enumeration("Visual severity tone.", ["critical", "healthy", "watch"]),
+    value: s.string("Metric value.")
+  }
+});
 
-    void fetch(`${serverHttpUrl}/config`, {
-      signal: abortController.signal
-    })
-      .then(async (response) => {
-        if (!response.ok) {
-          throw new Error(
-            `Server config request failed with ${response.status}.`
-          );
-        }
-
-        const json: unknown = await response.json();
-        const parsed = demoServerConfigSchema.safeParse(json);
-        if (!parsed.success) {
-          throw new Error("Server config payload is invalid.");
-        }
-
-        return parsed.data;
-      })
-      .then((config) => {
-        setState({
-          isLoading: false,
-          realtimeSessionUrl: config.realtimeSessionUrl
-        });
-      })
-      .catch((error: unknown) => {
-        if (abortController.signal.aborted) {
-          return;
-        }
-
-        const message =
-          error instanceof Error ? error.message : "Unknown config error.";
-        setState({
-          error: message,
-          isLoading: false
-        });
-      });
-
-    return (): void => {
-      abortController.abort();
-    };
-  }, [serverHttpUrl]);
-
-  return state;
-};
-
-/**
- * Creates an async delay that is abortable via `AbortSignal`.
- *
- * @param ms Delay in milliseconds.
- * @param signal Abort signal.
- * @returns Promise resolved when delay completes.
- */
-const waitFor = (ms: number, signal: AbortSignal): Promise<void> => {
-  return new Promise((resolve, reject) => {
-    const timeoutId = setTimeout(() => {
-      resolve();
-    }, ms);
-
-    signal.addEventListener(
-      "abort",
-      () => {
-        clearTimeout(timeoutId);
-        reject(new Error("Operation aborted."));
-      },
-      {
-        once: true
-      }
-    );
-  });
-};
+const taskListComponent = exposeComponent(TaskList, {
+  description: "Displays a checklist of next actions.",
+  name: "TaskList",
+  props: {
+    items: s.array("Action items.", s.string("Action text.")),
+    title: s.string("Checklist title.")
+  }
+});
 
 /**
  * Renders the interactive voice-first agent console.
@@ -238,18 +196,6 @@ const AgentConsole = (): ReactElement => {
     );
   }
 
-  useEffect(() => {
-    if (!voiceAgent.isRunning || voiceAgent.voiceInputStatus !== "idle") {
-      return;
-    }
-
-    void voiceAgent.startVoiceInput();
-  }, [
-    voiceAgent.isRunning,
-    voiceAgent.startVoiceInput,
-    voiceAgent.voiceInputStatus
-  ]);
-
   return (
     <section className="panel">
       <h2>Voice Console</h2>
@@ -262,10 +208,7 @@ const AgentConsole = (): ReactElement => {
       <div className="button-row">
         <button
           className="primary"
-          disabled={
-            voiceAgent.status === "connecting" ||
-            voiceAgent.status === "running"
-          }
+          disabled={!voiceAgent.canConnect}
           onClick={voiceAgent.start}
           type="button"
         >
@@ -273,7 +216,7 @@ const AgentConsole = (): ReactElement => {
         </button>
         <button
           className="secondary"
-          disabled={voiceAgent.status === "idle"}
+          disabled={!voiceAgent.canDisconnect}
           onClick={voiceAgent.stop}
           type="button"
         >
@@ -283,9 +226,7 @@ const AgentConsole = (): ReactElement => {
       <div className="button-row">
         <button
           className="primary"
-          disabled={
-            !voiceAgent.isRunning || voiceAgent.voiceInputStatus === "recording"
-          }
+          disabled={!voiceAgent.canStartVoiceInput}
           onClick={() => {
             void voiceAgent.startVoiceInput();
           }}
@@ -295,7 +236,7 @@ const AgentConsole = (): ReactElement => {
         </button>
         <button
           className="secondary"
-          disabled={voiceAgent.voiceInputStatus !== "recording"}
+          disabled={!voiceAgent.canStopVoiceInput}
           onClick={() => {
             voiceAgent.stopVoiceInput({
               commit: false
@@ -336,161 +277,47 @@ const AgentConsole = (): ReactElement => {
  * @returns Demo app element.
  */
 export const App = (): ReactElement => {
-  const [logs, setLogs] = useState<readonly LogEntry[]>([]);
-  const serverHttpUrl = defaultServerHttpUrl;
-  const config = useDemoServerConfig(serverHttpUrl);
-
-  /**
-   * Appends a new log entry in reverse chronological order.
-   *
-   * @param level Log severity.
-   * @param message Log message.
-   */
-  const appendLog = useCallback(
-    (level: "error" | "info", message: string): void => {
-      setLogs((previous) => {
-        const next: LogEntry = {
-          id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
-          level,
-          message,
-          timestamp: new Date().toISOString()
-        };
-        return [next, ...previous].slice(0, 10);
-      });
-    },
-    []
-  );
-
-  /**
-   * Handles warnings emitted by Frenchfry provider internals.
-   *
-   * @param warning Structured warning payload.
-   */
-  const handleWarning = useCallback(
-    (warning: FrenchfryWarning): void => {
-      appendLog("error", `${warning.code}: ${warning.message}`);
-    },
-    [appendLog]
-  );
-
-  const statusPill = useMemo(() => {
-    return exposeComponent(StatusPill, {
-      description: "Displays a concise service health badge.",
-      name: "StatusPill",
-      props: {
-        label: s.string("Short status label."),
-        tone: s.enumeration("Visual severity tone.", [
-          "critical",
-          "healthy",
-          "watch"
-        ])
-      }
-    });
-  }, []);
-
-  const statCard = useMemo(() => {
-    return exposeComponent(StatCard, {
-      description: "Displays a metric label and value card.",
-      name: "StatCard",
-      props: {
-        label: s.string("Metric label."),
-        tone: s.enumeration("Visual severity tone.", [
-          "critical",
-          "healthy",
-          "watch"
-        ]),
-        value: s.string("Metric value.")
-      }
-    });
-  }, []);
-
-  const taskList = useMemo(() => {
-    return exposeComponent(TaskList, {
-      description: "Displays a checklist of next actions.",
-      name: "TaskList",
-      props: {
-        items: s.array("Action items.", s.string("Action text.")),
-        title: s.string("Checklist title.")
-      }
-    });
-  }, []);
-
   const uiKit = useUiKit({
-    components: [statusPill, statCard, taskList]
+    components: [statusPillComponent, statCardComponent, taskListComponent]
   });
 
   const genUi = useGenUi({
     kit: uiKit,
-    outlet: "voice-main",
+    outlet: generatedUiOutlet,
     toolNames: ["render_ui"]
   });
 
   const lookupOrderEtaTool = useTool({
-    deps: [appendLog],
+    deps: [],
     description:
       "Return ETA details for a delivery order when provided an order identifier.",
-    handler: async (
-      input: { orderId: string },
-      abortSignal: AbortSignal
-    ): Promise<unknown> => {
-      await waitFor(300, abortSignal);
-      appendLog("info", `Tool lookup_order_eta called for ${input.orderId}.`);
-
-      return {
+    handler: (input: { orderId: string }): Promise<unknown> => {
+      return Promise.resolve({
         confidence: "high",
         etaMinutes: 14,
         orderId: input.orderId.toUpperCase(),
         route: "Warehouse 7 -> Mission District"
-      };
+      });
     },
     name: "lookup_order_eta",
     schema: s.object("Order lookup input.", {
       orderId: s.string("Unique order identifier.")
     })
   });
-  const tools = useMemo<readonly [typeof lookupOrderEtaTool]>(() => {
-    return [lookupOrderEtaTool];
-  }, [lookupOrderEtaTool]);
-
-  if (config.isLoading) {
-    return (
-      <main className="app-shell">
-        <section className="panel">
-          <h1>Frenchfry Demo</h1>
-          <p>Loading demo server configuration...</p>
-        </section>
-      </main>
-    );
-  }
-
-  if (config.error !== undefined || config.realtimeSessionUrl === undefined) {
-    return (
-      <main className="app-shell">
-        <section className="panel">
-          <h1>Frenchfry Demo</h1>
-          <p className="error-line">
-            Failed to load server config:{" "}
-            {config.error ?? "Missing session URL."}
-          </p>
-          <p className="muted">
-            Expected server endpoint: {serverHttpUrl}/config
-          </p>
-        </section>
-      </main>
-    );
-  }
 
   return (
-    <FrenchfryProvider onWarning={handleWarning}>
+    <FrenchfryProvider>
       <main className="app-shell">
         <header className="hero">
           <h1>Frenchfry Voice + Generative UI Demo</h1>
           <p>
-            Runtime session endpoint: <code>{config.realtimeSessionUrl}</code>
+            Runtime endpoint: <code>{runtimeUrl}</code>
           </p>
         </header>
         <VoiceAgent
+          autoStartVoiceInput
           genUi={[genUi]}
+          runtimeUrl={runtimeUrl}
           session={{
             audio: {
               input: {
@@ -511,8 +338,7 @@ export const App = (): ReactElement => {
             tool_choice: "auto",
             type: "realtime"
           }}
-          sessionEndpoint={config.realtimeSessionUrl}
-          tools={tools}
+          tools={[lookupOrderEtaTool]}
         >
           {() => {
             return <AgentConsole />;
@@ -526,25 +352,8 @@ export const App = (): ReactElement => {
                 Ask by voice for an order update and request a status dashboard.
               </p>
             }
-            name="voice-main"
+            name={generatedUiOutlet}
           />
-        </section>
-        <section className="panel">
-          <h2>Runtime Log</h2>
-          {logs.length === 0 ? (
-            <p className="muted">No warnings yet.</p>
-          ) : (
-            <ul className="log-list">
-              {logs.map((entry) => {
-                return (
-                  <li key={entry.id}>
-                    <strong>{entry.level.toUpperCase()}</strong> [
-                    {entry.timestamp}] {entry.message}
-                  </li>
-                );
-              })}
-            </ul>
-          )}
         </section>
       </main>
     </FrenchfryProvider>

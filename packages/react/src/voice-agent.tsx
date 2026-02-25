@@ -41,13 +41,15 @@ import {
  * Represents props for the `VoiceAgent` orchestration component.
  */
 export type VoiceAgentProps = {
+  autoStartVoiceInput?: boolean;
   children: (agent: VoiceAgentRenderState) => ReactNode;
   genUi?: readonly GenUiRegistration[];
+  runtimeUrl?: string;
   session: {
     model: string;
     type: "realtime";
   } & Record<string, unknown>;
-  sessionEndpoint: string;
+  sessionEndpoint?: string;
   toolTimeoutMs?: number;
   tools?: readonly Chat.AnyTool[];
 };
@@ -67,9 +69,26 @@ type SessionToolDefinition = {
  */
 export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
   const toolTimeoutMs = props.toolTimeoutMs ?? 15000;
+  const [resolvedSessionEndpoint, setResolvedSessionEndpoint] = useState<
+    string | undefined
+  >(props.sessionEndpoint);
   const sessionSignature = useMemo(() => {
     return JSON.stringify(props.session);
   }, [props.session]);
+  const stableSessionRef = useRef<{
+    session: VoiceAgentProps["session"];
+    signature: string;
+  }>({
+    session: props.session,
+    signature: sessionSignature
+  });
+  if (stableSessionRef.current.signature !== sessionSignature) {
+    stableSessionRef.current = {
+      session: props.session,
+      signature: sessionSignature
+    };
+  }
+  const stableSession = stableSessionRef.current.session;
   const hashbrownSessionTools = useMemo<
     readonly SessionToolDefinition[]
   >(() => {
@@ -93,11 +112,15 @@ export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
   }, [props.genUi]);
 
   const realtimeClient = useMemo(() => {
+    if (resolvedSessionEndpoint === undefined) {
+      return null;
+    }
+
     return createRealtimeClient({
-      session: props.session,
-      sessionEndpoint: props.sessionEndpoint
+      session: stableSession,
+      sessionEndpoint: resolvedSessionEndpoint
     });
-  }, [props.sessionEndpoint, sessionSignature]);
+  }, [resolvedSessionEndpoint, stableSession]);
 
   const toolRegistry = useMemo(() => {
     return createToolRegistry([
@@ -117,6 +140,24 @@ export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
     (event: FunctionCallArgumentsDoneEvent) => Promise<void>
   >(async () => {});
 
+  /**
+   * Removes a tracked active tool call and any cached metadata for the call id.
+   *
+   * @param callId Tool call identifier.
+   */
+  const clearActiveToolCall = useCallback((callId: string): void => {
+    setActiveCallsById((previous) => {
+      if (!(callId in previous)) {
+        return previous;
+      }
+
+      const remaining = { ...previous };
+      delete remaining[callId];
+      return remaining;
+    });
+    toolNameByCallIdRef.current.delete(callId);
+  }, []);
+
   useEffect(() => {
     genUiRegistrationsRef.current = props.genUi;
   }, [props.genUi]);
@@ -130,6 +171,7 @@ export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
   const [voiceInputStatus, setVoiceInputStatus] = useState<
     "idle" | "recording" | "unsupported"
   >("idle");
+  const [assistantAudioActive, setAssistantAudioActive] = useState(false);
   const [genUiToolsConfigured, setGenUiToolsConfigured] = useState(false);
   const [lastError, setLastError] = useState<
     | {
@@ -139,6 +181,42 @@ export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
     | undefined
   >(undefined);
   const remoteAudioElementRef = useRef<HTMLAudioElement | null>(null);
+  const voiceInputStatusRef = useRef(voiceInputStatus);
+
+  useEffect(() => {
+    voiceInputStatusRef.current = voiceInputStatus;
+  }, [voiceInputStatus]);
+
+  useEffect(() => {
+    setResolvedSessionEndpoint(props.sessionEndpoint);
+  }, [props.sessionEndpoint]);
+
+  useEffect(() => {
+    if (props.sessionEndpoint !== undefined || props.runtimeUrl === undefined) {
+      return;
+    }
+
+    const abortController = new AbortController();
+
+    void fetchRuntimeSessionEndpoint(props.runtimeUrl, abortController.signal)
+      .then((sessionEndpoint) => {
+        setResolvedSessionEndpoint(sessionEndpoint);
+      })
+      .catch((error: unknown) => {
+        if (abortController.signal.aborted) {
+          return;
+        }
+
+        setLastError({
+          message: toErrorMessage(error),
+          type: "runtime_config_error"
+        });
+      });
+
+    return (): void => {
+      abortController.abort();
+    };
+  }, [props.runtimeUrl, props.sessionEndpoint]);
 
   /**
    * Applies a core server event to internal tracked tool-call state.
@@ -235,6 +313,10 @@ export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
    */
   const sendEvents = useCallback(
     (events: readonly CoreClientEvent[]): void => {
+      if (realtimeClient === null) {
+        return;
+      }
+
       for (const event of events) {
         realtimeClient.send(event);
       }
@@ -318,16 +400,15 @@ export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
       });
       sendEvents(outputEvents);
 
-      setActiveCallsById((previous) => {
-        const remaining = { ...previous };
-        delete remaining[event.call_id];
-        return remaining;
-      });
-      toolNameByCallIdRef.current.delete(event.call_id);
+      clearActiveToolCall(event.call_id);
     };
-  }, [sendEvents, toolRegistry, toolTimeoutMs]);
+  }, [clearActiveToolCall, sendEvents, toolRegistry, toolTimeoutMs]);
 
   useEffect(() => {
+    if (realtimeClient === null) {
+      return;
+    }
+
     const subscription = new Subscription();
 
     subscription.add(
@@ -383,10 +464,32 @@ export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
         }
 
         if (event.type === "runtime.connection.closed") {
+          setAssistantAudioActive(false);
+          setActiveCallsById({});
           toolNameByCallIdRef.current.clear();
           setVoiceInputStatus("idle");
           setStatus("idle");
           return;
+        }
+
+        if (event.type === "output_audio_buffer.started") {
+          setAssistantAudioActive(true);
+          if (
+            props.autoStartVoiceInput &&
+            voiceInputStatusRef.current === "recording"
+          ) {
+            void realtimeClient.setMicrophoneEnabled(false);
+            setVoiceInputStatus("idle");
+          }
+          return;
+        }
+
+        if (
+          event.type === "output_audio_buffer.cleared" ||
+          event.type === "response.output_audio.done" ||
+          event.type === "response.done"
+        ) {
+          setAssistantAudioActive(false);
         }
 
         if (isErrorEvent(event)) {
@@ -421,6 +524,7 @@ export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
             shouldExecute: shouldExecuteDoneEvent
           });
           if (!shouldExecuteDoneEvent) {
+            clearActiveToolCall(event.call_id);
             return;
           }
 
@@ -461,6 +565,7 @@ export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
           shouldExecute: shouldExecuteOutputItemDone
         });
         if (!shouldExecuteOutputItemDone) {
+          clearActiveToolCall(outputItemDoneEvent.call_id);
           return;
         }
 
@@ -484,9 +589,19 @@ export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
     return (): void => {
       subscription.unsubscribe();
     };
-  }, [applyAccumulatorEvent, ensureRemoteAudioElement, realtimeClient]);
+  }, [
+    applyAccumulatorEvent,
+    clearActiveToolCall,
+    ensureRemoteAudioElement,
+    props.autoStartVoiceInput,
+    realtimeClient
+  ]);
 
   useEffect(() => {
+    if (realtimeClient === null) {
+      return;
+    }
+
     return (): void => {
       realtimeClient.disconnect();
       cleanupRemoteAudioElement();
@@ -497,6 +612,16 @@ export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
    * Starts the voice agent realtime session.
    */
   const start = useCallback((): void => {
+    if (realtimeClient === null) {
+      setLastError({
+        message:
+          "Session endpoint is not configured. Provide sessionEndpoint or runtimeUrl.",
+        type: "voice_connection_error"
+      });
+      setStatus("error");
+      return;
+    }
+
     setLastError(undefined);
     setStatus("connecting");
     void realtimeClient.connect().catch((error: unknown) => {
@@ -512,6 +637,15 @@ export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
    * Enables microphone capture by toggling the WebRTC local audio track.
    */
   const startVoiceInput = useCallback(async (): Promise<void> => {
+    if (realtimeClient === null) {
+      setLastError({
+        message:
+          "Session endpoint is not configured. Provide sessionEndpoint or runtimeUrl.",
+        type: "voice_input_error"
+      });
+      return;
+    }
+
     if (status !== "running") {
       setLastError({
         message: "Cannot start voice input before connection is running.",
@@ -535,6 +669,10 @@ export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
    */
   const stopVoiceInput = useCallback(
     (options?: { commit?: boolean }): void => {
+      if (realtimeClient === null) {
+        return;
+      }
+
       void options;
       if (voiceInputStatus !== "recording") {
         return;
@@ -554,7 +692,7 @@ export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
       commit: false
     });
     setStatus("stopping");
-    realtimeClient.disconnect();
+    realtimeClient?.disconnect();
     setActiveCallsById({});
     accumulatorStateRef.current = createToolCallAccumulatorState();
     toolNameByCallIdRef.current.clear();
@@ -572,14 +710,52 @@ export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
         type: string;
       } & Record<string, unknown>
     ): void => {
+      if (realtimeClient === null) {
+        return;
+      }
+
       realtimeClient.send(event);
     },
     [realtimeClient]
   );
 
+  useEffect(() => {
+    if (!props.autoStartVoiceInput) {
+      return;
+    }
+
+    if (
+      status !== "running" ||
+      voiceInputStatus !== "idle" ||
+      assistantAudioActive
+    ) {
+      return;
+    }
+
+    void startVoiceInput();
+  }, [
+    assistantAudioActive,
+    props.autoStartVoiceInput,
+    startVoiceInput,
+    status,
+    voiceInputStatus
+  ]);
+
   const renderState = useMemo<VoiceAgentRenderState>(() => {
+    const canConnect = !(status === "connecting" || status === "running");
+    const canDisconnect = status !== "idle";
+    const canStartVoiceInput =
+      status === "running" &&
+      voiceInputStatus !== "recording" &&
+      !assistantAudioActive;
+    const canStopVoiceInput = voiceInputStatus === "recording";
+
     return {
       activeToolCalls: Object.values(activeCallsById),
+      canConnect,
+      canDisconnect,
+      canStartVoiceInput,
+      canStopVoiceInput,
       isConnected: status === "running",
       isRunning: status === "running",
       ...(lastError === undefined ? {} : { lastError }),
@@ -600,7 +776,8 @@ export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
     status,
     stop,
     stopVoiceInput,
-    voiceInputStatus
+    voiceInputStatus,
+    assistantAudioActive
   ]);
 
   return (
@@ -898,6 +1075,66 @@ const resolveOutputItemDoneArguments = (
   }
 
   return accumulatorEntry.argumentText;
+};
+
+/**
+ * Fetches runtime config from a runtime URL and extracts the realtime session endpoint.
+ *
+ * @param runtimeUrl Base runtime URL.
+ * @param abortSignal Abort signal for request cancellation.
+ * @returns Resolved realtime session endpoint URL.
+ */
+const fetchRuntimeSessionEndpoint = async (
+  runtimeUrl: string,
+  abortSignal: AbortSignal
+): Promise<string> => {
+  const response = await fetch(resolveRuntimeConfigUrl(runtimeUrl), {
+    signal: abortSignal
+  });
+
+  if (!response.ok) {
+    throw new Error(`Runtime config request failed with ${response.status}.`);
+  }
+
+  const payload: unknown = await response.json();
+  if (!isRuntimeConfig(payload)) {
+    throw new Error("Runtime config payload is invalid.");
+  }
+
+  return payload.realtimeSessionUrl;
+};
+
+/**
+ * Determines whether a runtime config payload contains a realtime session URL.
+ *
+ * @param value Unknown runtime value.
+ * @returns True when payload matches the expected runtime config shape.
+ */
+const isRuntimeConfig = (
+  value: unknown
+): value is {
+  realtimeSessionUrl: string;
+} => {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+
+  if (!("realtimeSessionUrl" in value)) {
+    return false;
+  }
+
+  return typeof value.realtimeSessionUrl === "string";
+};
+
+/**
+ * Resolves the runtime config endpoint from a runtime base URL.
+ *
+ * @param runtimeUrl Runtime base URL.
+ * @returns Absolute runtime config URL.
+ */
+const resolveRuntimeConfigUrl = (runtimeUrl: string): string => {
+  const baseUrl = runtimeUrl.endsWith("/") ? runtimeUrl : `${runtimeUrl}/`;
+  return new URL("config", baseUrl).toString();
 };
 
 /**

@@ -18,6 +18,10 @@ export type ActiveToolCallState = {
  */
 export type VoiceAgentRenderState = {
   activeToolCalls: ActiveToolCallState[];
+  canConnect: boolean;
+  canDisconnect: boolean;
+  canStartVoiceInput: boolean;
+  canStopVoiceInput: boolean;
   isConnected: boolean;
   isRunning: boolean;
   lastError?: {

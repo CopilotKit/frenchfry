@@ -12,7 +12,9 @@ import { type VoiceAgentRenderState } from "../src/use-voice-agent";
 const connectMock = vi.fn(() => Promise.resolve());
 const createRealtimeClientMock = vi.fn();
 const disconnectMock = vi.fn();
-const sendMock = vi.fn();
+const sendMock = vi.fn((event: unknown) => {
+  return event;
+});
 const setMicrophoneEnabledMock = vi.fn(() => Promise.resolve());
 
 type FakeRealtimeClient = {
@@ -20,7 +22,7 @@ type FakeRealtimeClient = {
   disconnect: () => void;
   events$: Subject<{ type: string } & Record<string, unknown>>;
   remoteAudioStream$: Subject<MediaStream>;
-  send: () => void;
+  send: (event: unknown) => unknown;
   setMicrophoneEnabled: (enabled: boolean) => Promise<void>;
   toolCallStarts$: Subject<{
     callId: string;
@@ -70,6 +72,16 @@ const createSession = (): { model: string; type: "realtime" } => {
   };
 };
 
+/**
+ * Determines whether a runtime value is an object map.
+ *
+ * @param value Runtime value.
+ * @returns True when value is an object map.
+ */
+const isRecord = (value: unknown): value is Record<string, unknown> => {
+  return typeof value === "object" && value !== null;
+};
+
 test("VoiceAgent remains connecting until runtime.connection.open", () => {
   // Arrange
   fakeRealtimeClient = createFakeRealtimeClient();
@@ -102,6 +114,10 @@ test("VoiceAgent remains connecting until runtime.connection.open", () => {
   expect(latest?.status).toBe("connecting");
   expect(latest?.isConnected).toBe(false);
   expect(latest?.isRunning).toBe(false);
+  expect(latest?.canConnect).toBe(false);
+  expect(latest?.canDisconnect).toBe(true);
+  expect(latest?.canStartVoiceInput).toBe(false);
+  expect(latest?.canStopVoiceInput).toBe(false);
 
   // Act
   act(() => {
@@ -114,6 +130,10 @@ test("VoiceAgent remains connecting until runtime.connection.open", () => {
   expect(latest?.status).toBe("running");
   expect(latest?.isConnected).toBe(true);
   expect(latest?.isRunning).toBe(true);
+  expect(latest?.canConnect).toBe(false);
+  expect(latest?.canDisconnect).toBe(true);
+  expect(latest?.canStartVoiceInput).toBe(true);
+  expect(latest?.canStopVoiceInput).toBe(false);
   expect(typeof latest?.startVoiceInput).toBe("function");
   expect(typeof latest?.stopVoiceInput).toBe("function");
   expect(latest?.voiceInputStatus).toBe("idle");
@@ -162,6 +182,166 @@ test("VoiceAgent toggles microphone through setMicrophoneEnabled", async () => {
   // Assert
   expect(setMicrophoneEnabledMock).toHaveBeenNthCalledWith(1, true);
   expect(setMicrophoneEnabledMock).toHaveBeenNthCalledWith(2, false);
+  expect(latest?.canStartVoiceInput).toBe(true);
+  expect(latest?.canStopVoiceInput).toBe(false);
+});
+
+test("VoiceAgent auto-starts voice input when configured", async () => {
+  // Arrange
+  fakeRealtimeClient = createFakeRealtimeClient();
+  createRealtimeClientMock.mockClear();
+  setMicrophoneEnabledMock.mockClear();
+
+  render(
+    createElement(VoiceAgent, {
+      autoStartVoiceInput: true,
+      children: () => null,
+      session: createSession(),
+      sessionEndpoint: "http://localhost/realtime/session",
+      tools: []
+    })
+  );
+
+  // Act
+  await act(async () => {
+    fakeRealtimeClient.events$.next({
+      type: "runtime.connection.open"
+    });
+    await Promise.resolve();
+  });
+
+  // Assert
+  expect(setMicrophoneEnabledMock).toHaveBeenCalledWith(true);
+});
+
+test("VoiceAgent pauses auto voice input while assistant audio is active", async () => {
+  // Arrange
+  fakeRealtimeClient = createFakeRealtimeClient();
+  createRealtimeClientMock.mockClear();
+  setMicrophoneEnabledMock.mockClear();
+  let latest: VoiceAgentRenderState | undefined;
+
+  render(
+    createElement(VoiceAgent, {
+      autoStartVoiceInput: true,
+      children: (agent: VoiceAgentRenderState) => {
+        latest = agent;
+        return null;
+      },
+      session: createSession(),
+      sessionEndpoint: "http://localhost/realtime/session",
+      tools: []
+    })
+  );
+
+  if (latest === undefined) {
+    throw new Error("Expected render state");
+  }
+
+  // Act
+  await act(async () => {
+    fakeRealtimeClient.events$.next({
+      type: "runtime.connection.open"
+    });
+    await Promise.resolve();
+  });
+
+  // Assert
+  expect(setMicrophoneEnabledMock).toHaveBeenCalledTimes(1);
+  expect(setMicrophoneEnabledMock).toHaveBeenNthCalledWith(1, true);
+
+  // Act
+  await act(async () => {
+    fakeRealtimeClient.events$.next({
+      type: "output_audio_buffer.started"
+    });
+    await Promise.resolve();
+  });
+
+  // Assert
+  expect(setMicrophoneEnabledMock).toHaveBeenCalledTimes(2);
+  expect(setMicrophoneEnabledMock).toHaveBeenNthCalledWith(2, false);
+  expect(latest.voiceInputStatus).toBe("idle");
+  expect(latest.canStartVoiceInput).toBe(false);
+
+  // Act
+  await act(async () => {
+    fakeRealtimeClient.events$.next({
+      type: "response.done"
+    });
+    await Promise.resolve();
+  });
+
+  // Assert
+  expect(setMicrophoneEnabledMock).toHaveBeenCalledTimes(3);
+  expect(setMicrophoneEnabledMock).toHaveBeenNthCalledWith(3, true);
+});
+
+test("VoiceAgent resolves session endpoint from runtimeUrl", async () => {
+  // Arrange
+  fakeRealtimeClient = createFakeRealtimeClient();
+  createRealtimeClientMock.mockClear();
+  const fetchMock = vi.fn<
+    (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
+  >((input, init): Promise<Response> => {
+    void input;
+    void init;
+    return Promise.resolve(
+      new Response(
+        JSON.stringify({
+          realtimeSessionUrl: "http://localhost/realtime/session"
+        }),
+        {
+          status: 200
+        }
+      )
+    );
+  });
+  vi.stubGlobal("fetch", fetchMock);
+
+  try {
+    // Act
+    render(
+      createElement(VoiceAgent, {
+        children: () => null,
+        runtimeUrl: "http://localhost:8787",
+        session: createSession(),
+        tools: []
+      })
+    );
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const firstFetchCall = fetchMock.mock.calls.at(0);
+    if (firstFetchCall === undefined) {
+      throw new Error("Expected runtime config fetch call.");
+    }
+
+    const fetchOptions = firstFetchCall[1];
+    if (typeof fetchOptions !== "object" || fetchOptions === null) {
+      throw new Error("Expected fetch options object.");
+    }
+
+    // Assert
+    expect(firstFetchCall[0]).toBe("http://localhost:8787/config");
+    expect("signal" in fetchOptions).toBe(true);
+    if (!("signal" in fetchOptions)) {
+      throw new Error("Expected abort signal option.");
+    }
+    expect(fetchOptions.signal).toBeInstanceOf(AbortSignal);
+    expect(createRealtimeClientMock).toHaveBeenCalledWith({
+      session: {
+        model: "gpt-realtime",
+        type: "realtime"
+      },
+      sessionEndpoint: "http://localhost/realtime/session"
+    });
+  } finally {
+    vi.unstubAllGlobals();
+  }
 });
 
 test("VoiceAgent startVoiceInput before running reports error", async () => {
@@ -309,10 +489,10 @@ test("VoiceAgent auto-registers hashbrown tools and normalizes schema for sessio
       tools: [
         {
           description: "Lookup order ETA",
-          handler: async () => {
-            return {
+          handler: () => {
+            return Promise.resolve({
               etaMinutes: 14
-            };
+            });
           },
           name: "lookup_order_eta",
           schema: s.object("Order lookup input.", {
@@ -331,33 +511,61 @@ test("VoiceAgent auto-registers hashbrown tools and normalizes schema for sessio
   });
 
   // Assert
-  expect(sendMock).toHaveBeenCalledWith(
-    expect.objectContaining({
-      session: {
-        tools: [
-          expect.objectContaining({
-            description: "Lookup order ETA",
-            name: "lookup_order_eta",
-            parameters: expect.objectContaining({
-              additionalProperties: false,
-              description: "Order lookup input.",
-              properties: {
-                orderId: {
-                  description: "Unique order identifier.",
-                  type: "string"
-                }
-              },
-              required: ["orderId"],
-              type: "object"
-            }),
-            type: "function"
-          })
-        ],
-        type: "realtime"
-      },
-      type: "session.update"
-    })
-  );
+  const firstSendCall = sendMock.mock.calls.at(0);
+  if (firstSendCall === undefined) {
+    throw new Error("Expected at least one sent event.");
+  }
+
+  const sentEvent = firstSendCall[0];
+  if (!isRecord(sentEvent)) {
+    throw new Error("Expected sent event object.");
+  }
+  expect(sentEvent.type).toBe("session.update");
+
+  const session = sentEvent.session;
+  if (!isRecord(session)) {
+    throw new Error("Expected session update payload.");
+  }
+  expect(session.type).toBe("realtime");
+
+  const tools = session.tools;
+  if (!Array.isArray(tools)) {
+    throw new Error("Expected session tools array.");
+  }
+  const sessionTools: unknown[] = tools;
+
+  const lookupTool = sessionTools.find((tool) => {
+    return (
+      isRecord(tool) &&
+      tool.type === "function" &&
+      tool.name === "lookup_order_eta"
+    );
+  });
+
+  if (!isRecord(lookupTool)) {
+    throw new Error("Expected lookup_order_eta session tool.");
+  }
+
+  expect(lookupTool.description).toBe("Lookup order ETA");
+  expect(lookupTool.type).toBe("function");
+  if (!isRecord(lookupTool.parameters)) {
+    throw new Error("Expected tool parameters object.");
+  }
+  expect(lookupTool.parameters.additionalProperties).toBe(false);
+  expect(lookupTool.parameters.description).toBe("Order lookup input.");
+  expect(lookupTool.parameters.required).toEqual(["orderId"]);
+  expect(lookupTool.parameters.type).toBe("object");
+
+  const properties = lookupTool.parameters.properties;
+  if (!isRecord(properties)) {
+    throw new Error("Expected tool properties object.");
+  }
+  const orderIdProperty = properties.orderId;
+  if (!isRecord(orderIdProperty)) {
+    throw new Error("Expected orderId property schema.");
+  }
+  expect(orderIdProperty.description).toBe("Unique order identifier.");
+  expect(orderIdProperty.type).toBe("string");
 });
 
 test("VoiceAgent forwards tool argument chunks from toolCallStarts$ to genUi", () => {
@@ -432,10 +640,14 @@ test("VoiceAgent executes a done tool call once for duplicate done events", asyn
   createRealtimeClientMock.mockClear();
   sendMock.mockClear();
   const initialCallCount = sendMock.mock.calls.length;
+  let latest: VoiceAgentRenderState | undefined;
 
   render(
     createElement(VoiceAgent, {
-      children: () => null,
+      children: (agent: VoiceAgentRenderState) => {
+        latest = agent;
+        return null;
+      },
       session: createSession(),
       sessionEndpoint: "http://localhost/realtime/session",
       tools: [
@@ -484,6 +696,7 @@ test("VoiceAgent executes a done tool call once for duplicate done events", asyn
       type: "response.create"
     })
   );
+  expect(latest?.activeToolCalls).toHaveLength(0);
 });
 
 test("VoiceAgent executes tool call from output-item.done and ignores later duplicate done event", async () => {
@@ -492,10 +705,14 @@ test("VoiceAgent executes tool call from output-item.done and ignores later dupl
   createRealtimeClientMock.mockClear();
   sendMock.mockClear();
   const initialCallCount = sendMock.mock.calls.length;
+  let latest: VoiceAgentRenderState | undefined;
 
   render(
     createElement(VoiceAgent, {
-      children: () => null,
+      children: (agent: VoiceAgentRenderState) => {
+        latest = agent;
+        return null;
+      },
       session: createSession(),
       sessionEndpoint: "http://localhost/realtime/session",
       tools: [
@@ -551,6 +768,7 @@ test("VoiceAgent executes tool call from output-item.done and ignores later dupl
       type: "response.create"
     })
   );
+  expect(latest?.activeToolCalls).toHaveLength(0);
 });
 
 test("VoiceAgent applies output-item-added metadata to active tool call names", () => {

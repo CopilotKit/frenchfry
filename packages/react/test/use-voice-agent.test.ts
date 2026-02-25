@@ -43,6 +43,10 @@ test("useVoiceAgent returns context value when provider is present", () => {
   // Arrange
   const value: VoiceAgentRenderState = {
     activeToolCalls: [],
+    canConnect: false,
+    canDisconnect: true,
+    canStartVoiceInput: true,
+    canStopVoiceInput: false,
     isConnected: true,
     isRunning: true,
     sendEvent: () => {
