@@ -1,0 +1,4 @@
+interface:
+  display_name: "NPM Release"
+  short_description: "Version, changelog, commit, and tag npm releases"
+  default_prompt: "Use $release-npm-packages to run quality gates, bump package versions from conventional commits, update CHANGELOG.md, commit, and tag the release."
