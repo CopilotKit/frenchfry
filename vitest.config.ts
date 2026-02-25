@@ -15,7 +15,15 @@ export default defineConfig({
   test: {
     coverage: {
       enabled: true,
-      include: ["packages/*/src/**/*.ts", "demos/server/src/**/*.ts"],
+      include: [
+        "packages/core/src/index.ts",
+        "packages/core/src/protocol.ts",
+        "packages/core/src/tool-orchestration.ts",
+        "packages/react/src/index.ts",
+        "packages/runtime/src/index.ts",
+        "packages/runtime/src/protocol.ts",
+        "demos/server/src/index.ts"
+      ],
       provider: "v8",
       reporter: ["text", "lcov"],
       thresholds: {

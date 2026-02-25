@@ -39,13 +39,17 @@ import { type GenUiRegistration } from "./use-gen-ui";
 export type VoiceAgentProps = {
   children: (agent: VoiceAgentRenderState) => ReactNode;
   genUi?: readonly GenUiRegistration[];
+  session: {
+    model: string;
+    type: "realtime";
+  } & Record<string, unknown>;
+  sessionEndpoint: string;
   toolTimeoutMs?: number;
   tools?: readonly OrchestrationTool[];
-  url: string;
 };
 
 /**
- * Owns realtime websocket lifecycle, tool invocation loop, and render-prop state for voice sessions.
+ * Owns realtime WebRTC lifecycle, tool invocation loop, and render-prop state for voice sessions.
  *
  * @param props Voice agent configuration.
  * @returns Provider-wrapped render-prop output.
@@ -54,9 +58,10 @@ export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
   const toolTimeoutMs = props.toolTimeoutMs ?? 15000;
   const realtimeClient = useMemo(() => {
     return createRealtimeClient({
-      url: props.url
+      session: props.session,
+      sessionEndpoint: props.sessionEndpoint
     });
-  }, [props.url]);
+  }, [props.session, props.sessionEndpoint]);
 
   const toolRegistry = useMemo(() => {
     return createToolRegistry(props.tools ?? []);
@@ -82,13 +87,7 @@ export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
       }
     | undefined
   >(undefined);
-  const audioContextRef = useRef<AudioContext | null>(null);
-  const audioSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
-  const audioProcessorRef = useRef<ScriptProcessorNode | null>(null);
-  const mediaStreamRef = useRef<MediaStream | null>(null);
-  const recordingActiveRef = useRef(false);
-  const outputAudioContextRef = useRef<AudioContext | null>(null);
-  const playbackQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const remoteAudioElementRef = useRef<HTMLAudioElement | null>(null);
 
   /**
    * Applies a core server event to internal tracked tool-call state.
@@ -141,101 +140,40 @@ export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
   );
 
   /**
-   * Releases active browser audio-capture resources.
-   */
-  const cleanupVoiceInputResources = useCallback((): void => {
-    audioProcessorRef.current?.disconnect();
-    audioSourceRef.current?.disconnect();
-
-    mediaStreamRef.current?.getTracks().forEach((track) => {
-      track.stop();
-    });
-
-    if (audioContextRef.current !== null) {
-      void audioContextRef.current.close();
-    }
-
-    audioProcessorRef.current = null;
-    audioSourceRef.current = null;
-    mediaStreamRef.current = null;
-    audioContextRef.current = null;
-    recordingActiveRef.current = false;
-  }, []);
-
-  /**
-   * Releases active browser audio-playback resources and resets playback queue ordering.
-   */
-  const cleanupVoiceOutputResources = useCallback((): void => {
-    const outputAudioContext = outputAudioContextRef.current;
-    if (outputAudioContext !== null) {
-      void outputAudioContext.close();
-    }
-    outputAudioContextRef.current = null;
-    playbackQueueRef.current = Promise.resolve();
-  }, []);
-
-  /**
-   * Creates or reuses the output audio context used for assistant speech playback.
+   * Creates and caches an audio element for remote assistant speech.
    *
-   * @returns Output audio context or `null` when unsupported.
+   * @returns Audio element, or `null` when DOM APIs are unavailable.
    */
-  const ensureOutputAudioContext = useCallback((): AudioContext | null => {
-    if (outputAudioContextRef.current !== null) {
-      return outputAudioContextRef.current;
+  const ensureRemoteAudioElement = useCallback((): HTMLAudioElement | null => {
+    if (remoteAudioElementRef.current !== null) {
+      return remoteAudioElementRef.current;
     }
 
-    if (typeof AudioContext === "undefined") {
+    if (typeof document === "undefined") {
       return null;
     }
 
-    const outputAudioContext = new AudioContext();
-    outputAudioContextRef.current = outputAudioContext;
-    return outputAudioContext;
+    const audioElement = document.createElement("audio");
+    audioElement.autoplay = true;
+    audioElement.style.display = "none";
+    document.body.appendChild(audioElement);
+    remoteAudioElementRef.current = audioElement;
+    return audioElement;
   }, []);
 
   /**
-   * Queues a PCM16 assistant audio chunk for sequential playback.
-   *
-   * @param input Audio chunk payload and sample-rate metadata.
+   * Removes remote audio element and clears active media binding.
    */
-  const queueAssistantAudioChunk = useCallback(
-    (input: { base64Audio: string; sampleRateHz: number }): void => {
-      const outputAudioContext = ensureOutputAudioContext();
-      if (outputAudioContext === null) {
-        return;
-      }
+  const cleanupRemoteAudioElement = useCallback((): void => {
+    const audioElement = remoteAudioElementRef.current;
+    if (audioElement === null) {
+      return;
+    }
 
-      const samples = decodePcm16Base64(input.base64Audio);
-      if (samples.length === 0) {
-        return;
-      }
-
-      playbackQueueRef.current = playbackQueueRef.current
-        .then(async () => {
-          const currentContext = outputAudioContextRef.current;
-          if (currentContext === null) {
-            return;
-          }
-
-          if (currentContext.state === "suspended") {
-            await currentContext.resume();
-          }
-
-          await playMonoPcmChunk({
-            audioContext: currentContext,
-            samples,
-            sampleRateHz: input.sampleRateHz
-          });
-        })
-        .catch(() => {
-          setLastError({
-            message: "Assistant audio playback failed.",
-            type: "voice_output_error"
-          });
-        });
-    },
-    [ensureOutputAudioContext]
-  );
+    audioElement.srcObject = null;
+    audioElement.remove();
+    remoteAudioElementRef.current = null;
+  }, []);
 
   /**
    * Sends all generated client events through the active realtime client.
@@ -319,6 +257,20 @@ export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
     );
 
     subscription.add(
+      realtimeClient.remoteAudioStream$.subscribe((stream) => {
+        const audioElement = ensureRemoteAudioElement();
+        if (audioElement === null) {
+          return;
+        }
+
+        audioElement.srcObject = stream;
+        void audioElement.play().catch(() => {
+          return;
+        });
+      })
+    );
+
+    subscription.add(
       realtimeClient.events$.subscribe((event) => {
         const updatedAtMs = Date.now();
 
@@ -330,18 +282,8 @@ export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
         }
 
         if (event.type === "runtime.connection.closed") {
-          cleanupVoiceInputResources();
-          cleanupVoiceOutputResources();
           setVoiceInputStatus("idle");
           setStatus("idle");
-          return;
-        }
-
-        if (isResponseAudioDeltaEvent(event)) {
-          queueAssistantAudioChunk({
-            base64Audio: event.delta,
-            sampleRateHz: event.sample_rate_hz ?? 24000
-          });
           return;
         }
 
@@ -384,33 +326,36 @@ export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
     };
   }, [
     applyAccumulatorEvent,
-    cleanupVoiceInputResources,
-    cleanupVoiceOutputResources,
+    ensureRemoteAudioElement,
     executeToolCall,
     props.genUi,
-    queueAssistantAudioChunk,
     realtimeClient
   ]);
 
   useEffect(() => {
     return (): void => {
-      cleanupVoiceInputResources();
-      cleanupVoiceOutputResources();
       realtimeClient.disconnect();
+      cleanupRemoteAudioElement();
     };
-  }, [cleanupVoiceInputResources, cleanupVoiceOutputResources, realtimeClient]);
+  }, [cleanupRemoteAudioElement, realtimeClient]);
 
   /**
-   * Starts the voice agent websocket session.
+   * Starts the voice agent realtime session.
    */
   const start = useCallback((): void => {
     setLastError(undefined);
     setStatus("connecting");
-    realtimeClient.connect();
+    void realtimeClient.connect().catch((error: unknown) => {
+      setLastError({
+        message: toErrorMessage(error),
+        type: "voice_connection_error"
+      });
+      setStatus("error");
+    });
   }, [realtimeClient]);
 
   /**
-   * Starts microphone capture and streams PCM16 audio into the realtime session.
+   * Enables microphone capture by toggling the WebRTC local audio track.
    */
   const startVoiceInput = useCallback(async (): Promise<void> => {
     if (status !== "running") {
@@ -425,119 +370,44 @@ export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
       return;
     }
 
-    if (
-      typeof navigator === "undefined" ||
-      navigator.mediaDevices === undefined ||
-      navigator.mediaDevices.getUserMedia === undefined ||
-      typeof AudioContext === "undefined"
-    ) {
-      setVoiceInputStatus("unsupported");
-      setLastError({
-        message: "Browser does not support required microphone APIs.",
-        type: "voice_input_unsupported"
-      });
-      return;
-    }
-
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          channelCount: 1,
-          echoCancellation: true,
-          noiseSuppression: true
-        }
-      });
-      const audioContext = new AudioContext();
-      const sourceNode = audioContext.createMediaStreamSource(stream);
-      const processorNode = audioContext.createScriptProcessor(4096, 1, 1);
-
-      processorNode.onaudioprocess = (event): void => {
-        if (!recordingActiveRef.current) {
-          return;
-        }
-
-        const sourceSamples = event.inputBuffer.getChannelData(0);
-        const downsampled = downsampleMonoPcm(
-          sourceSamples,
-          audioContext.sampleRate,
-          16000
-        );
-        const base64Audio = encodePcm16Base64(downsampled);
-
-        realtimeClient.send({
-          audio: base64Audio,
-          type: "input_audio_buffer.append"
-        });
-      };
-
-      sourceNode.connect(processorNode);
-      processorNode.connect(audioContext.destination);
-
-      mediaStreamRef.current = stream;
-      audioContextRef.current = audioContext;
-      audioSourceRef.current = sourceNode;
-      audioProcessorRef.current = processorNode;
-      recordingActiveRef.current = true;
-      setVoiceInputStatus("recording");
-    } catch (error: unknown) {
-      cleanupVoiceInputResources();
-      setVoiceInputStatus("idle");
-      setLastError({
-        message: toErrorMessage(error),
-        type: "voice_input_error"
-      });
-    }
-  }, [cleanupVoiceInputResources, realtimeClient, status, voiceInputStatus]);
+    await realtimeClient.setMicrophoneEnabled(true);
+    setVoiceInputStatus("recording");
+  }, [realtimeClient, status, voiceInputStatus]);
 
   /**
-   * Stops microphone capture and optionally commits buffered input audio.
+   * Disables microphone capture by muting local audio track.
    *
    * @param options Stop behavior options.
    */
   const stopVoiceInput = useCallback(
     (options?: { commit?: boolean }): void => {
+      void options;
       if (voiceInputStatus !== "recording") {
         return;
       }
 
-      cleanupVoiceInputResources();
+      void realtimeClient.setMicrophoneEnabled(false);
       setVoiceInputStatus("idle");
-
-      const commit = options?.commit ?? true;
-      if (!commit || status !== "running") {
-        return;
-      }
-
-      realtimeClient.send({
-        type: "input_audio_buffer.commit"
-      });
-      realtimeClient.send({
-        response: {
-          modalities: ["audio", "text"]
-        },
-        type: "response.create"
-      });
     },
-    [cleanupVoiceInputResources, realtimeClient, status, voiceInputStatus]
+    [realtimeClient, voiceInputStatus]
   );
 
   /**
-   * Stops the voice agent websocket session.
+   * Stops the voice agent realtime session.
    */
   const stop = useCallback((): void => {
     stopVoiceInput({
       commit: false
     });
-    cleanupVoiceOutputResources();
     setStatus("stopping");
     realtimeClient.disconnect();
     setActiveCallsById({});
     accumulatorStateRef.current = createToolCallAccumulatorState();
     setStatus("idle");
-  }, [cleanupVoiceOutputResources, realtimeClient, stopVoiceInput]);
+  }, [realtimeClient, stopVoiceInput]);
 
   /**
-   * Sends a client event to the runtime websocket session.
+   * Sends a client event to the runtime realtime session.
    *
    * @param event Event payload.
    */
@@ -615,204 +485,19 @@ const handleErrorEvent = (
 };
 
 /**
- * Downsamples mono float32 PCM samples to a target sample rate.
+ * Converts unknown errors to user-facing string messages.
  *
- * @param input Source mono samples.
- * @param sourceRate Source sample rate.
- * @param targetRate Target sample rate.
- * @returns Downsampled mono samples.
- */
-const downsampleMonoPcm = (
-  input: Float32Array,
-  sourceRate: number,
-  targetRate: number
-): Float32Array => {
-  if (sourceRate === targetRate) {
-    return input;
-  }
-
-  const ratio = sourceRate / targetRate;
-  const outputLength = Math.max(1, Math.floor(input.length / ratio));
-  const output = new Float32Array(outputLength);
-  let sourceIndex = 0;
-
-  for (let outputIndex = 0; outputIndex < outputLength; outputIndex += 1) {
-    const nextSourceIndex = Math.min(
-      input.length,
-      Math.floor((outputIndex + 1) * ratio)
-    );
-
-    let total = 0;
-    let count = 0;
-    while (sourceIndex < nextSourceIndex) {
-      total += input[sourceIndex] ?? 0;
-      count += 1;
-      sourceIndex += 1;
-    }
-
-    output[outputIndex] = count === 0 ? 0 : total / count;
-  }
-
-  return output;
-};
-
-/**
- * Encodes mono float32 PCM samples into base64 PCM16 bytes.
- *
- * @param input Mono float32 samples in range [-1, 1].
- * @returns Base64-encoded PCM16 payload.
- */
-const encodePcm16Base64 = (input: Float32Array): string => {
-  const bytes = new Uint8Array(input.length * 2);
-
-  input.forEach((sample, index) => {
-    const clamped = Math.max(-1, Math.min(1, sample));
-    const int16Value =
-      clamped < 0 ? Math.round(clamped * 32768) : Math.round(clamped * 32767);
-    const byteOffset = index * 2;
-    bytes[byteOffset] = int16Value & 255;
-    bytes[byteOffset + 1] = (int16Value >> 8) & 255;
-  });
-
-  let binary = "";
-  const chunkSize = 0x8000;
-  for (let offset = 0; offset < bytes.length; offset += chunkSize) {
-    const chunk = bytes.subarray(offset, offset + chunkSize);
-    binary += String.fromCharCode(...chunk);
-  }
-
-  return btoa(binary);
-};
-
-/**
- * Decodes base64 PCM16 mono bytes into float32 samples in range [-1, 1].
- *
- * @param base64Audio Base64-encoded PCM16 little-endian bytes.
- * @returns Decoded mono samples.
- */
-const decodePcm16Base64 = (base64Audio: string): Float32Array => {
-  if (base64Audio.length === 0) {
-    return new Float32Array(0);
-  }
-
-  try {
-    const bytes = decodeBase64Bytes(base64Audio);
-    const sampleCount = Math.floor(bytes.length / 2);
-    const output = new Float32Array(sampleCount);
-
-    for (let sampleIndex = 0; sampleIndex < sampleCount; sampleIndex += 1) {
-      const byteOffset = sampleIndex * 2;
-      const lowByte = bytes[byteOffset] ?? 0;
-      const highByte = bytes[byteOffset + 1] ?? 0;
-      const value = (highByte << 8) | lowByte;
-      const signed = value >= 0x8000 ? value - 0x10000 : value;
-      output[sampleIndex] = Math.max(-1, Math.min(1, signed / 32768));
-    }
-
-    return output;
-  } catch {
-    return new Float32Array(0);
-  }
-};
-
-/**
- * Decodes a base64 string into raw bytes for runtime-compatible environments.
- *
- * @param base64Text Base64 string.
- * @returns Decoded bytes.
- */
-const decodeBase64Bytes = (base64Text: string): Uint8Array => {
-  if (typeof atob === "function") {
-    const binary = atob(base64Text);
-    const bytes = new Uint8Array(binary.length);
-
-    for (let byteIndex = 0; byteIndex < binary.length; byteIndex += 1) {
-      bytes[byteIndex] = binary.charCodeAt(byteIndex);
-    }
-
-    return bytes;
-  }
-
-  if (typeof Buffer !== "undefined") {
-    return Uint8Array.from(Buffer.from(base64Text, "base64"));
-  }
-
-  throw new Error("No base64 decoder is available in this runtime.");
-};
-
-/**
- * Plays a mono PCM chunk through an audio context and resolves after playback finishes.
- *
- * @param input Audio context, sample-rate, and mono sample data.
- * @returns Promise resolved when source playback ends.
- */
-const playMonoPcmChunk = (input: {
-  audioContext: AudioContext;
-  sampleRateHz: number;
-  samples: Float32Array;
-}): Promise<void> => {
-  return new Promise((resolve) => {
-    const audioBuffer = input.audioContext.createBuffer(
-      1,
-      input.samples.length,
-      input.sampleRateHz
-    );
-    const channelData = audioBuffer.getChannelData(0);
-    channelData.set(input.samples);
-
-    const sourceNode = input.audioContext.createBufferSource();
-    sourceNode.buffer = audioBuffer;
-    sourceNode.connect(input.audioContext.destination);
-    sourceNode.onended = () => {
-      sourceNode.disconnect();
-      resolve();
-    };
-    sourceNode.start();
-  });
-};
-
-/**
- * Type guard for assistant audio delta server events.
- *
- * @param event Core server event.
- * @returns `true` when the event is an audio delta.
- */
-const isResponseAudioDeltaEvent = (
-  event: CoreServerEvent
-): event is {
-  delta: string;
-  sample_rate_hz?: number;
-  type: "response.audio.delta";
-} => {
-  if (event.type !== "response.audio.delta") {
-    return false;
-  }
-
-  if (!("delta" in event) || typeof event.delta !== "string") {
-    return false;
-  }
-
-  if (
-    "sample_rate_hz" in event &&
-    event.sample_rate_hz !== undefined &&
-    typeof event.sample_rate_hz !== "number"
-  ) {
-    return false;
-  }
-
-  return true;
-};
-
-/**
- * Converts unknown errors into a readable message.
- *
- * @param error Unknown error value.
- * @returns Message string.
+ * @param error Unknown error input.
+ * @returns Readable error message.
  */
 const toErrorMessage = (error: unknown): string => {
-  if (error instanceof Error && error.message.length > 0) {
+  if (error instanceof Error) {
     return error.message;
   }
 
-  return "Unknown voice input error.";
+  if (typeof error === "string") {
+    return error;
+  }
+
+  return "Unknown error";
 };

@@ -1,117 +1,28 @@
-import { EventEmitter } from "node:events";
-
 import { Hono } from "hono";
 import { expect, test } from "vitest";
-import { z } from "zod";
 
 import {
   RUNTIME_PACKAGE_NAME,
-  buildOpenAIHeaders,
-  buildOpenAIRealtimeUrl,
-  registerRealtimeProxy,
-  type ClientSocket,
-  type RuntimeNodeWebSocketAdapter,
-  type UpstreamSocket
+  parseRuntimeClientProtocolEvent,
+  registerRealtimeSessionRoute
 } from "../src/index";
 
-class FakeUpstreamSocket extends EventEmitter implements UpstreamSocket {
-  public readonly closeCalls: Array<{
-    code: number | undefined;
-    reason: string | undefined;
-  }> = [];
-
-  public readonly sentPayloads: string[] = [];
-
-  public close(code?: number, reason?: string): void {
-    this.closeCalls.push({ code, reason });
-    this.emit("close", code ?? 1000, Buffer.from(reason ?? ""));
-  }
-
-  public send(payload: string): void {
-    this.sentPayloads.push(payload);
-  }
-}
-
-class FakeClientSocket implements ClientSocket {
-  public readonly closeCalls: Array<{
-    code: number | undefined;
-    reason: string | undefined;
-  }> = [];
-
-  public readonly sentPayloads: string[] = [];
-
-  public close(code?: number, reason?: string): void {
-    this.closeCalls.push({ code, reason });
-  }
-
-  public send(payload: string | ArrayBuffer | Uint8Array<ArrayBuffer>): void {
-    if (typeof payload !== "string") {
-      throw new Error("Expected JSON text payload in tests.");
-    }
-    this.sentPayloads.push(payload);
-  }
-}
-
-type Lifecycle = {
-  onClose: (event: unknown, socket: ClientSocket) => void;
-  onMessage: (
-    event: { data: string | ArrayBufferLike | Blob },
-    socket: ClientSocket
-  ) => void;
-  onOpen: (event: unknown, socket: ClientSocket) => void;
-};
-
 /**
- * Creates a minimal node websocket adapter for capturing lifecycle handlers in tests.
+ * Creates a basic valid multipart request payload for realtime session exchange.
  *
- * @param sink Mutable sink where the registered lifecycle factory is written.
- * @returns Runtime node websocket adapter stub.
+ * @returns Multipart form payload with `sdp` and `session` fields.
  */
-const createNodeWebSocketAdapterStub = (sink: {
-  lifecycleFactory?: (context: unknown) => Lifecycle;
-}): RuntimeNodeWebSocketAdapter => {
-  return {
-    injectWebSocket: () => {
-      return;
-    },
-    upgradeWebSocket: (configure) => {
-      sink.lifecycleFactory = configure;
-
-      return () => {
-        return new Response("ok");
-      };
-    }
-  };
-};
-
-/**
- * Parses a serialized JSON message produced by socket test doubles.
- *
- * @param serialized JSON string payload.
- * @returns Parsed object payload.
- */
-const parseSentPayload = (serialized: string): Record<string, unknown> => {
-  const parsed: unknown = JSON.parse(serialized);
-  const parsedResult = z.record(z.string(), z.unknown()).safeParse(parsed);
-  if (!parsedResult.success) {
-    throw new Error("Expected JSON object payload.");
-  }
-  return parsedResult.data;
-};
-
-/**
- * Retrieves a payload from the socket payload list, throwing when missing.
- *
- * @param payloads Serialized payload list.
- * @param index Target index.
- * @returns Payload string at index.
- */
-const getPayloadAt = (payloads: string[], index: number): string => {
-  const payload = payloads.at(index);
-  if (payload === undefined) {
-    throw new Error(`Expected payload at index ${index}.`);
-  }
-  return payload;
+const createValidSessionPayload = (): FormData => {
+  const formData = new FormData();
+  formData.set("sdp", "v=0\r\no=- 0 0 IN IP4 127.0.0.1");
+  formData.set(
+    "session",
+    JSON.stringify({
+      model: "gpt-realtime",
+      type: "realtime"
+    })
+  );
+  return formData;
 };
 
 test("runtime package exposes a stable name marker", () => {
@@ -125,622 +36,281 @@ test("runtime package exposes a stable name marker", () => {
   expect(actualName).toBe(expectedName);
 });
 
-test("buildOpenAIRealtimeUrl defaults to gpt-realtime model", () => {
+test("parseRuntimeClientProtocolEvent accepts valid pass-through events", () => {
   // Arrange
-  const options = {
-    apiKey: "test-key"
+  const input = {
+    response: {},
+    type: "response.create"
   };
 
   // Act
-  const url = buildOpenAIRealtimeUrl(options);
+  const parsed = parseRuntimeClientProtocolEvent(input);
 
   // Assert
-  expect(url).toBe("wss://api.openai.com/v1/realtime?model=gpt-realtime");
+  expect(parsed).toEqual(input);
 });
 
-test("buildOpenAIHeaders omits beta header by default", () => {
-  // Arrange
-  const options = {
-    apiKey: "test-key"
-  };
-
-  // Act
-  const headers = buildOpenAIHeaders(options);
-
-  // Assert
-  expect(headers.Authorization).toBe("Bearer test-key");
-  expect(headers["OpenAI-Beta"]).toBeUndefined();
+test("parseRuntimeClientProtocolEvent rejects invalid payload", () => {
+  // Arrange / Act / Assert
+  expect(() => {
+    parseRuntimeClientProtocolEvent({
+      type: ""
+    });
+  }).toThrow("Client event is not a valid runtime protocol payload.");
 });
 
-test("buildOpenAIHeaders includes beta header when configured", () => {
-  // Arrange
-  const options = {
-    apiKey: "test-key",
-    includeBetaHeader: true
-  };
-
-  // Act
-  const headers = buildOpenAIHeaders(options);
-
-  // Assert
-  expect(headers["OpenAI-Beta"]).toBe("realtime=v1");
-});
-
-test("buildOpenAIHeaders includes organization and project headers", () => {
-  // Arrange
-  const options = {
-    apiKey: "test-key",
-    organization: "org_1",
-    project: "proj_1"
-  };
-
-  // Act
-  const headers = buildOpenAIHeaders(options);
-
-  // Assert
-  expect(headers["OpenAI-Organization"]).toBe("org_1");
-  expect(headers["OpenAI-Project"]).toBe("proj_1");
-});
-
-test("registerRealtimeProxy uses default route path", () => {
+test("registerRealtimeSessionRoute uses default route path", () => {
   // Arrange
   const app = new Hono();
 
   // Act
-  const registration = registerRealtimeProxy(app, {
-    createNodeWebSocket: () => createNodeWebSocketAdapterStub({}),
+  const registration = registerRealtimeSessionRoute(app, {
     openai: {
       apiKey: "test-key"
     }
   });
 
   // Assert
-  expect(registration.path).toBe("/realtime/ws");
-  expect(app.routes.some((route) => route.path === "/realtime/ws")).toBe(true);
+  expect(registration.path).toBe("/realtime/session");
+  expect(app.routes.some((route) => route.path === "/realtime/session")).toBe(
+    true
+  );
 });
 
-test("registerRealtimeProxy uses custom route path", () => {
+test("registerRealtimeSessionRoute uses custom route path", () => {
   // Arrange
   const app = new Hono();
 
   // Act
-  const registration = registerRealtimeProxy(app, {
-    createNodeWebSocket: () => createNodeWebSocketAdapterStub({}),
+  const registration = registerRealtimeSessionRoute(app, {
     openai: {
       apiKey: "test-key"
     },
-    path: "/ws/custom"
+    path: "/custom/session"
   });
 
   // Assert
-  expect(registration.path).toBe("/ws/custom");
-  expect(app.routes.some((route) => route.path === "/ws/custom")).toBe(true);
+  expect(registration.path).toBe("/custom/session");
+  expect(app.routes.some((route) => route.path === "/custom/session")).toBe(
+    true
+  );
 });
 
-test("runtime converts tool success event to function_call_output and response.create", () => {
+test("realtime session route forwards multipart payload to OpenAI and returns answer sdp", async () => {
   // Arrange
   const app = new Hono();
-  const fakeUpstreamSocket = new FakeUpstreamSocket();
-  const fakeClientSocket = new FakeClientSocket();
-  const sink: { lifecycleFactory?: (context: unknown) => Lifecycle } = {};
+  const originalFetch = globalThis.fetch;
+  let authorizationHeader: string | null = null;
+  let forwardedSdp: string | null = null;
+  let forwardedSession: string | null = null;
 
-  registerRealtimeProxy(app, {
-    createNodeWebSocket: () => createNodeWebSocketAdapterStub(sink),
-    createUpstreamSocket: () => fakeUpstreamSocket,
-    openai: {
-      apiKey: "test-key"
+  const mockedFetch: typeof fetch = (_input, init) => {
+    authorizationHeader =
+      init?.headers instanceof Headers
+        ? init.headers.get("Authorization")
+        : Array.isArray(init?.headers)
+          ? new Headers(init?.headers).get("Authorization")
+          : new Headers(init?.headers ?? {}).get("Authorization");
+
+    if (!(init?.body instanceof FormData)) {
+      throw new Error(
+        "Expected OpenAI request body to be multipart form data."
+      );
     }
-  });
 
-  if (sink.lifecycleFactory === undefined) {
-    throw new Error("Expected websocket lifecycle factory to be captured.");
-  }
+    const sdp = init.body.get("sdp");
+    const session = init.body.get("session");
 
-  const lifecycle = sink.lifecycleFactory({});
+    forwardedSdp = typeof sdp === "string" ? sdp : null;
+    forwardedSession = typeof session === "string" ? session : null;
 
-  // Act
-  lifecycle.onOpen({}, fakeClientSocket);
-  fakeUpstreamSocket.emit("open");
-  lifecycle.onMessage(
-    {
-      data: JSON.stringify({
-        callId: "call_123",
-        output: {
-          data: { city: "San Francisco" },
-          ok: true
-        },
-        type: "runtime.tool.success"
+    return Promise.resolve(
+      new Response("answer-sdp", {
+        status: 200
       })
-    },
-    fakeClientSocket
-  );
+    );
+  };
 
-  // Assert
-  expect(fakeUpstreamSocket.sentPayloads).toHaveLength(2);
+  Reflect.set(globalThis, "fetch", mockedFetch);
 
-  const firstPayload = fakeUpstreamSocket.sentPayloads.at(0);
-  const secondPayload = fakeUpstreamSocket.sentPayloads.at(1);
-  if (firstPayload === undefined || secondPayload === undefined) {
-    throw new Error("Expected two upstream payloads.");
-  }
-  const firstEvent = parseSentPayload(firstPayload);
-  const secondEvent = parseSentPayload(secondPayload);
-
-  expect(firstEvent.type).toBe("conversation.item.create");
-  expect(firstEvent.item).toEqual({
-    call_id: "call_123",
-    output: JSON.stringify({ data: { city: "San Francisco" }, ok: true }),
-    type: "function_call_output"
-  });
-  expect(secondEvent.type).toBe("response.create");
-});
-
-test("runtime forwards upstream events to client unchanged", () => {
-  // Arrange
-  const app = new Hono();
-  const fakeUpstreamSocket = new FakeUpstreamSocket();
-  const fakeClientSocket = new FakeClientSocket();
-  const sink: { lifecycleFactory?: (context: unknown) => Lifecycle } = {};
-
-  registerRealtimeProxy(app, {
-    createNodeWebSocket: () => createNodeWebSocketAdapterStub(sink),
-    createUpstreamSocket: () => fakeUpstreamSocket,
+  registerRealtimeSessionRoute(app, {
     openai: {
       apiKey: "test-key"
     }
   });
 
-  if (sink.lifecycleFactory === undefined) {
-    throw new Error("Expected websocket lifecycle factory to be captured.");
+  try {
+    // Act
+    const response = await app.request("http://localhost/realtime/session", {
+      body: createValidSessionPayload(),
+      method: "POST"
+    });
+
+    // Assert
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toContain("application/sdp");
+    expect(await response.text()).toBe("answer-sdp");
+    expect(authorizationHeader).toBe("Bearer test-key");
+    expect(forwardedSdp).toContain("v=0");
+    if (forwardedSession === null) {
+      throw new Error("Expected forwarded session payload.");
+    }
+    expect(JSON.parse(forwardedSession)).toEqual({
+      model: "gpt-realtime",
+      type: "realtime"
+    });
+  } finally {
+    Reflect.set(globalThis, "fetch", originalFetch);
   }
-
-  const lifecycle = sink.lifecycleFactory({});
-
-  // Act
-  lifecycle.onOpen({}, fakeClientSocket);
-  fakeUpstreamSocket.emit("open");
-  fakeUpstreamSocket.emit(
-    "message",
-    JSON.stringify({
-      delta: "hello",
-      type: "response.output_text.delta"
-    })
-  );
-
-  // Assert
-  expect(fakeClientSocket.sentPayloads).toHaveLength(1);
-  const firstPayload = fakeClientSocket.sentPayloads.at(0);
-  if (firstPayload === undefined) {
-    throw new Error("Expected one client payload.");
-  }
-  expect(parseSentPayload(firstPayload)).toEqual({
-    delta: "hello",
-    type: "response.output_text.delta"
-  });
 });
 
-test("runtime emits error event when client payload is invalid JSON", () => {
+test("realtime session route returns 400 for missing multipart content type", async () => {
   // Arrange
   const app = new Hono();
-  const fakeUpstreamSocket = new FakeUpstreamSocket();
-  const fakeClientSocket = new FakeClientSocket();
-  const sink: { lifecycleFactory?: (context: unknown) => Lifecycle } = {};
-
-  registerRealtimeProxy(app, {
-    createNodeWebSocket: () => createNodeWebSocketAdapterStub(sink),
-    createUpstreamSocket: () => fakeUpstreamSocket,
+  registerRealtimeSessionRoute(app, {
     openai: {
       apiKey: "test-key"
     }
   });
 
-  if (sink.lifecycleFactory === undefined) {
-    throw new Error("Expected websocket lifecycle factory to be captured.");
-  }
-
-  const lifecycle = sink.lifecycleFactory({});
-
   // Act
-  lifecycle.onOpen({}, fakeClientSocket);
-  lifecycle.onMessage({ data: "{" }, fakeClientSocket);
+  const response = await app.request("http://localhost/realtime/session", {
+    body: "v=0",
+    headers: {
+      "content-type": "application/sdp"
+    },
+    method: "POST"
+  });
 
   // Assert
-  expect(fakeClientSocket.sentPayloads).toHaveLength(1);
-  const firstPayload = fakeClientSocket.sentPayloads.at(0);
-  if (firstPayload === undefined) {
-    throw new Error("Expected one client payload.");
-  }
-  expect(parseSentPayload(firstPayload)).toEqual({
-    error: {
-      message: "Client message must be valid JSON.",
-      type: "runtime_proxy_error"
-    },
-    type: "error"
-  });
+  expect(response.status).toBe(400);
+  expect(await response.text()).toBe("Request must use multipart/form-data.");
 });
 
-test("runtime queues passthrough event until upstream opens", () => {
+test("realtime session route returns 400 for missing sdp field", async () => {
   // Arrange
   const app = new Hono();
-  const fakeUpstreamSocket = new FakeUpstreamSocket();
-  const fakeClientSocket = new FakeClientSocket();
-  const sink: { lifecycleFactory?: (context: unknown) => Lifecycle } = {};
+  const payload = new FormData();
+  payload.set(
+    "session",
+    JSON.stringify({ model: "gpt-realtime", type: "realtime" })
+  );
 
-  registerRealtimeProxy(app, {
-    createNodeWebSocket: () => createNodeWebSocketAdapterStub(sink),
-    createUpstreamSocket: () => fakeUpstreamSocket,
+  registerRealtimeSessionRoute(app, {
     openai: {
       apiKey: "test-key"
     }
   });
 
-  if (sink.lifecycleFactory === undefined) {
-    throw new Error("Expected websocket lifecycle factory to be captured.");
-  }
-
-  const lifecycle = sink.lifecycleFactory({});
-
   // Act
-  lifecycle.onOpen({}, fakeClientSocket);
-  lifecycle.onMessage(
-    {
-      data: JSON.stringify({ type: "response.cancel" })
-    },
-    fakeClientSocket
-  );
-  expect(fakeUpstreamSocket.sentPayloads).toHaveLength(0);
-  fakeUpstreamSocket.emit("open");
+  const response = await app.request("http://localhost/realtime/session", {
+    body: payload,
+    method: "POST"
+  });
 
   // Assert
-  expect(fakeUpstreamSocket.sentPayloads).toHaveLength(1);
-  expect(
-    parseSentPayload(getPayloadAt(fakeUpstreamSocket.sentPayloads, 0))
-  ).toEqual({
-    type: "response.cancel"
-  });
+  expect(response.status).toBe(400);
+  expect(await response.text()).toBe("Missing sdp form field.");
 });
 
-test("runtime handles unsupported client payload type", () => {
+test("realtime session route returns 400 for invalid session payload", async () => {
   // Arrange
   const app = new Hono();
-  const fakeUpstreamSocket = new FakeUpstreamSocket();
-  const fakeClientSocket = new FakeClientSocket();
-  const sink: { lifecycleFactory?: (context: unknown) => Lifecycle } = {};
+  const payload = new FormData();
+  payload.set("sdp", "v=0");
+  payload.set("session", "not json");
 
-  registerRealtimeProxy(app, {
-    createNodeWebSocket: () => createNodeWebSocketAdapterStub(sink),
-    createUpstreamSocket: () => fakeUpstreamSocket,
+  registerRealtimeSessionRoute(app, {
     openai: {
       apiKey: "test-key"
     }
   });
 
-  if (sink.lifecycleFactory === undefined) {
-    throw new Error("Expected websocket lifecycle factory to be captured.");
-  }
-
-  const lifecycle = sink.lifecycleFactory({});
-
   // Act
-  lifecycle.onOpen({}, fakeClientSocket);
-  lifecycle.onMessage(
-    {
-      data: new Blob(["hello"], { type: "text/plain" })
-    },
-    fakeClientSocket
-  );
+  const response = await app.request("http://localhost/realtime/session", {
+    body: payload,
+    method: "POST"
+  });
 
   // Assert
-  expect(
-    parseSentPayload(getPayloadAt(fakeClientSocket.sentPayloads, 0))
-  ).toEqual({
-    error: {
-      message: "Client message must be valid UTF-8 text.",
-      type: "runtime_proxy_error"
-    },
-    type: "error"
-  });
+  expect(response.status).toBe(400);
+  expect(await response.text()).toBe("Session config must be valid JSON.");
 });
 
-test("runtime accepts array buffer client payloads", () => {
+test("realtime session route propagates OpenAI non-2xx response", async () => {
   // Arrange
   const app = new Hono();
-  const fakeUpstreamSocket = new FakeUpstreamSocket();
-  const fakeClientSocket = new FakeClientSocket();
-  const sink: { lifecycleFactory?: (context: unknown) => Lifecycle } = {};
+  const originalFetch = globalThis.fetch;
 
-  registerRealtimeProxy(app, {
-    createNodeWebSocket: () => createNodeWebSocketAdapterStub(sink),
-    createUpstreamSocket: () => fakeUpstreamSocket,
-    openai: { apiKey: "test-key" }
-  });
-
-  if (sink.lifecycleFactory === undefined) {
-    throw new Error("Expected websocket lifecycle factory to be captured.");
-  }
-
-  const lifecycle = sink.lifecycleFactory({});
-  lifecycle.onOpen({}, fakeClientSocket);
-  fakeUpstreamSocket.emit("open");
-
-  // Act
-  const encoded = Buffer.from(
-    JSON.stringify({ type: "response.cancel" }),
-    "utf8"
-  );
-  lifecycle.onMessage(
-    {
-      data: encoded.buffer.slice(
-        encoded.byteOffset,
-        encoded.byteOffset + encoded.byteLength
-      )
-    },
-    fakeClientSocket
-  );
-
-  // Assert
-  expect(
-    parseSentPayload(getPayloadAt(fakeUpstreamSocket.sentPayloads, 0))
-  ).toEqual({
-    type: "response.cancel"
-  });
-});
-
-test("runtime handles client protocol validation errors", () => {
-  // Arrange
-  const app = new Hono();
-  const fakeUpstreamSocket = new FakeUpstreamSocket();
-  const fakeClientSocket = new FakeClientSocket();
-  const sink: { lifecycleFactory?: (context: unknown) => Lifecycle } = {};
-
-  registerRealtimeProxy(app, {
-    createNodeWebSocket: () => createNodeWebSocketAdapterStub(sink),
-    createUpstreamSocket: () => fakeUpstreamSocket,
-    openai: {
-      apiKey: "test-key"
-    }
-  });
-
-  if (sink.lifecycleFactory === undefined) {
-    throw new Error("Expected websocket lifecycle factory to be captured.");
-  }
-
-  const lifecycle = sink.lifecycleFactory({});
-
-  // Act
-  lifecycle.onOpen({}, fakeClientSocket);
-  lifecycle.onMessage(
-    {
-      data: JSON.stringify({ type: "" })
-    },
-    fakeClientSocket
-  );
-
-  // Assert
-  expect(
-    parseSentPayload(getPayloadAt(fakeClientSocket.sentPayloads, 0))
-  ).toEqual({
-    error: {
-      message: "Client message failed protocol validation.",
-      type: "runtime_proxy_error"
-    },
-    type: "error"
-  });
-});
-
-test("runtime can disable automatic response.create after tool success", () => {
-  // Arrange
-  const app = new Hono();
-  const fakeUpstreamSocket = new FakeUpstreamSocket();
-  const fakeClientSocket = new FakeClientSocket();
-  const sink: { lifecycleFactory?: (context: unknown) => Lifecycle } = {};
-
-  registerRealtimeProxy(app, {
-    autoResponseAfterToolSuccess: false,
-    createNodeWebSocket: () => createNodeWebSocketAdapterStub(sink),
-    createUpstreamSocket: () => fakeUpstreamSocket,
-    openai: {
-      apiKey: "test-key"
-    }
-  });
-
-  if (sink.lifecycleFactory === undefined) {
-    throw new Error("Expected websocket lifecycle factory to be captured.");
-  }
-
-  const lifecycle = sink.lifecycleFactory({});
-
-  // Act
-  lifecycle.onOpen({}, fakeClientSocket);
-  fakeUpstreamSocket.emit("open");
-  lifecycle.onMessage(
-    {
-      data: JSON.stringify({
-        callId: "call_no_continue",
-        output: { ok: true },
-        type: "runtime.tool.success"
+  const mockedFetch: typeof fetch = () =>
+    Promise.resolve(
+      new Response("upstream failure", {
+        status: 401
       })
-    },
-    fakeClientSocket
-  );
+    );
 
-  // Assert
-  expect(fakeUpstreamSocket.sentPayloads).toHaveLength(1);
-  expect(
-    parseSentPayload(getPayloadAt(fakeUpstreamSocket.sentPayloads, 0)).type
-  ).toBe("conversation.item.create");
-});
+  Reflect.set(globalThis, "fetch", mockedFetch);
 
-test("runtime onClose closes both upstream and client sockets", () => {
-  // Arrange
-  const app = new Hono();
-  const fakeUpstreamSocket = new FakeUpstreamSocket();
-  const fakeClientSocket = new FakeClientSocket();
-  const sink: { lifecycleFactory?: (context: unknown) => Lifecycle } = {};
-
-  registerRealtimeProxy(app, {
-    createNodeWebSocket: () => createNodeWebSocketAdapterStub(sink),
-    createUpstreamSocket: () => fakeUpstreamSocket,
-    openai: { apiKey: "test-key" }
+  registerRealtimeSessionRoute(app, {
+    openai: {
+      apiKey: "test-key"
+    }
   });
 
-  if (sink.lifecycleFactory === undefined) {
-    throw new Error("Expected websocket lifecycle factory to be captured.");
+  try {
+    // Act
+    const response = await app.request("http://localhost/realtime/session", {
+      body: createValidSessionPayload(),
+      method: "POST"
+    });
+
+    // Assert
+    expect(response.status).toBe(401);
+    expect(await response.text()).toBe("upstream failure");
+  } finally {
+    Reflect.set(globalThis, "fetch", originalFetch);
   }
-
-  const lifecycle = sink.lifecycleFactory({});
-
-  // Act
-  lifecycle.onClose({}, fakeClientSocket);
-
-  // Assert
-  expect(fakeUpstreamSocket.closeCalls).toHaveLength(1);
-  expect(fakeClientSocket.closeCalls).toHaveLength(1);
 });
 
-test("runtime handles upstream invalid JSON and non-text payloads", () => {
+test("realtime session route returns 500 on fetch failure and logs", async () => {
   // Arrange
   const app = new Hono();
-  const fakeUpstreamSocket = new FakeUpstreamSocket();
-  const fakeClientSocket = new FakeClientSocket();
-  const sink: { lifecycleFactory?: (context: unknown) => Lifecycle } = {};
-
-  registerRealtimeProxy(app, {
-    createNodeWebSocket: () => createNodeWebSocketAdapterStub(sink),
-    createUpstreamSocket: () => fakeUpstreamSocket,
-    openai: { apiKey: "test-key" }
-  });
-
-  if (sink.lifecycleFactory === undefined) {
-    throw new Error("Expected websocket lifecycle factory to be captured.");
-  }
-
-  const lifecycle = sink.lifecycleFactory({});
-  lifecycle.onOpen({}, fakeClientSocket);
-  fakeUpstreamSocket.emit("open");
-
-  // Act
-  fakeUpstreamSocket.emit("message", "not-json");
-  fakeUpstreamSocket.emit("message", [Buffer.from("a"), Buffer.from("b")]);
-  fakeUpstreamSocket.emit("message", Buffer.from("[]", "utf8"));
-  fakeUpstreamSocket.emit("message", 123);
-
-  // Assert
-  expect(
-    parseSentPayload(getPayloadAt(fakeClientSocket.sentPayloads, 0))
-  ).toEqual({
-    error: {
-      message: "Received invalid JSON from upstream.",
-      type: "runtime_proxy_error"
-    },
-    type: "error"
-  });
-  expect(
-    parseSentPayload(getPayloadAt(fakeClientSocket.sentPayloads, 1))
-  ).toEqual({
-    error: {
-      message: "Received invalid JSON from upstream.",
-      type: "runtime_proxy_error"
-    },
-    type: "error"
-  });
-  expect(
-    parseSentPayload(getPayloadAt(fakeClientSocket.sentPayloads, 2))
-  ).toEqual({
-    error: {
-      message: "Received invalid JSON from upstream.",
-      type: "runtime_proxy_error"
-    },
-    type: "error"
-  });
-  expect(
-    parseSentPayload(getPayloadAt(fakeClientSocket.sentPayloads, 3))
-  ).toEqual({
-    error: {
-      message: "Received non-text upstream payload.",
-      type: "runtime_proxy_error"
-    },
-    type: "error"
-  });
-});
-
-test("runtime logs upstream error and transport error details", () => {
-  // Arrange
-  const app = new Hono();
-  const fakeUpstreamSocket = new FakeUpstreamSocket();
-  const fakeClientSocket = new FakeClientSocket();
-  const sink: { lifecycleFactory?: (context: unknown) => Lifecycle } = {};
-  const logs: Array<{ message: string; details?: Record<string, unknown> }> =
+  const logs: Array<{ details?: Record<string, unknown>; message: string }> =
     [];
+  const originalFetch = globalThis.fetch;
 
-  registerRealtimeProxy(app, {
-    createNodeWebSocket: () => createNodeWebSocketAdapterStub(sink),
-    createUpstreamSocket: () => fakeUpstreamSocket,
+  const mockedFetch: typeof fetch = () =>
+    Promise.reject(new Error("network down"));
+
+  Reflect.set(globalThis, "fetch", mockedFetch);
+
+  registerRealtimeSessionRoute(app, {
     onLog: (message, details) => {
       if (details === undefined) {
         logs.push({ message });
-      } else {
-        logs.push({ details, message });
+        return;
       }
+      logs.push({ details, message });
     },
-    openai: { apiKey: "test-key" }
+    openai: {
+      apiKey: "test-key"
+    }
   });
 
-  if (sink.lifecycleFactory === undefined) {
-    throw new Error("Expected websocket lifecycle factory to be captured.");
+  try {
+    // Act
+    const response = await app.request("http://localhost/realtime/session", {
+      body: createValidSessionPayload(),
+      method: "POST"
+    });
+
+    // Assert
+    expect(response.status).toBe(500);
+    expect(await response.text()).toBe("network down");
+    expect(
+      logs.some((entry) => entry.message === "runtime.session.call_failed")
+    ).toBe(true);
+  } finally {
+    Reflect.set(globalThis, "fetch", originalFetch);
   }
-
-  const lifecycle = sink.lifecycleFactory({});
-  lifecycle.onOpen({}, fakeClientSocket);
-  fakeUpstreamSocket.emit("open");
-
-  // Act
-  fakeUpstreamSocket.emit("message", JSON.stringify({ type: "error" }));
-  fakeUpstreamSocket.emit("error", new Error("boom"));
-  fakeUpstreamSocket.emit("error", "plain error");
-  fakeUpstreamSocket.emit("error", { hello: "world" });
-  fakeUpstreamSocket.emit("close", 1001, Buffer.from("bye"));
-
-  // Assert
-  expect(logs.some((entry) => entry.message === "runtime.upstream.error")).toBe(
-    true
-  );
-  expect(
-    logs.some(
-      (entry) =>
-        entry.message === "runtime.upstream.transport_error" &&
-        entry.details?.error === "Unknown error"
-    )
-  ).toBe(true);
-  expect(fakeClientSocket.closeCalls.some((entry) => entry.code === 1001)).toBe(
-    true
-  );
-});
-
-test("runtime handles upstream error before client onOpen wiring", () => {
-  // Arrange
-  const app = new Hono();
-  const fakeUpstreamSocket = new FakeUpstreamSocket();
-  const sink: { lifecycleFactory?: (context: unknown) => Lifecycle } = {};
-  const logs: string[] = [];
-
-  registerRealtimeProxy(app, {
-    createNodeWebSocket: () => createNodeWebSocketAdapterStub(sink),
-    createUpstreamSocket: () => fakeUpstreamSocket,
-    onLog: (message) => {
-      logs.push(message);
-    },
-    openai: { apiKey: "test-key" }
-  });
-
-  if (sink.lifecycleFactory === undefined) {
-    throw new Error("Expected websocket lifecycle factory to be captured.");
-  }
-
-  // Act
-  sink.lifecycleFactory({});
-  fakeUpstreamSocket.emit("error", new Error("upstream failed early"));
-
-  // Assert
-  expect(logs).toContain("runtime.upstream.transport_error");
 });

@@ -6,7 +6,6 @@ import type {
   ErrorEvent,
   FunctionCallArgumentsDeltaEvent,
   FunctionCallArgumentsDoneEvent,
-  RuntimeToolSuccessEvent,
   UnknownServerEvent
 } from "./types";
 
@@ -59,16 +58,6 @@ const unknownServerEventSchema = z
   })
   .catchall(z.unknown());
 
-const runtimeToolSuccessEventSchema = z.object({
-  callId: z.string().min(1),
-  output: z.object({
-    data: z.unknown().optional(),
-    meta: z.unknown().optional(),
-    ok: z.literal(true)
-  }),
-  type: z.literal("runtime.tool.success")
-});
-
 const clientPassThroughEventSchema = z
   .object({
     type: z.string().min(1)
@@ -116,12 +105,6 @@ export const parseCoreServerEvent = (rawEvent: unknown): CoreServerEvent => {
  * @returns Parsed client event.
  */
 export const parseCoreClientEvent = (rawEvent: unknown): CoreClientEvent => {
-  const runtimeResult = runtimeToolSuccessEventSchema.safeParse(rawEvent);
-
-  if (runtimeResult.success) {
-    return runtimeResult.data;
-  }
-
   const passThroughResult = clientPassThroughEventSchema.safeParse(rawEvent);
 
   if (!passThroughResult.success) {
@@ -163,18 +146,6 @@ export const isFunctionCallArgumentsDoneEvent = (
  */
 export const isErrorEvent = (event: CoreServerEvent): event is ErrorEvent => {
   return event.type === "error";
-};
-
-/**
- * Type guard for runtime tool success convenience events.
- *
- * @param event Parsed client event.
- * @returns `true` when event is a runtime tool success event.
- */
-export const isRuntimeToolSuccessEvent = (
-  event: CoreClientEvent
-): event is RuntimeToolSuccessEvent => {
-  return event.type === "runtime.tool.success";
 };
 
 /**

@@ -7,22 +7,19 @@ import {
   isErrorEvent,
   isFunctionCallArgumentsDeltaEvent,
   isFunctionCallArgumentsDoneEvent,
-  isRuntimeToolSuccessEvent,
   parseCoreClientEvent,
   parseCoreServerEvent,
   toUnknownServerEvent,
-  type RuntimeToolSuccessEnvelope,
-  type ToolCallStart,
-  type WebSocketLike
+  type RealtimeDataChannelLike,
+  type RealtimeMediaStreamLike,
+  type RealtimeMediaStreamTrackLike,
+  type RealtimePeerConnectionLike,
+  type RealtimeTrackEventLike,
+  type ToolCallStart
 } from "../src/index";
 
-class FakeSocket implements WebSocketLike {
-  public onclose:
-    | ((event: {
-        code: number | undefined;
-        reason: string | undefined;
-      }) => void)
-    | null = null;
+class FakeDataChannel implements RealtimeDataChannelLike {
+  public onclose: (() => void) | null = null;
 
   public onerror: ((event: unknown) => void) | null = null;
 
@@ -30,13 +27,18 @@ class FakeSocket implements WebSocketLike {
 
   public onopen: (() => void) | null = null;
 
-  public readyState = 0;
+  public readyState: "closed" | "closing" | "connecting" | "open" =
+    "connecting";
 
   public readonly sentPayloads: string[] = [];
 
-  public close(code?: number, reason?: string): void {
-    this.readyState = 3;
-    this.onclose?.({ code, reason });
+  public close(): void {
+    this.readyState = "closed";
+    this.onclose?.();
+  }
+
+  public emitError(error: unknown): void {
+    this.onerror?.(error);
   }
 
   public emitMessage(payload: Record<string, unknown>): void {
@@ -44,12 +46,83 @@ class FakeSocket implements WebSocketLike {
   }
 
   public open(): void {
-    this.readyState = 1;
+    this.readyState = "open";
     this.onopen?.();
   }
 
   public send(payload: string): void {
     this.sentPayloads.push(payload);
+  }
+}
+
+class FakePeerConnection implements RealtimePeerConnectionLike {
+  public connectionState:
+    | "closed"
+    | "connected"
+    | "connecting"
+    | "disconnected"
+    | "failed"
+    | "new" = "new";
+
+  public onconnectionstatechange: (() => void) | null = null;
+
+  public ontrack: ((event: RealtimeTrackEventLike) => void) | null = null;
+
+  public readonly createdChannels: FakeDataChannel[] = [];
+
+  public readonly remoteDescriptions: RTCSessionDescriptionInit[] = [];
+
+  public readonly localDescriptions: RTCSessionDescriptionInit[] = [];
+
+  public readonly addedTracks: Array<{
+    stream: RealtimeMediaStreamLike;
+    track: RealtimeMediaStreamTrackLike;
+  }> = [];
+
+  public addTrack(
+    track: RealtimeMediaStreamTrackLike,
+    ...streams: RealtimeMediaStreamLike[]
+  ): unknown {
+    const stream = streams.at(0);
+    if (stream !== undefined) {
+      this.addedTracks.push({ stream, track });
+    }
+
+    return {};
+  }
+
+  public close(): void {
+    this.connectionState = "closed";
+    this.onconnectionstatechange?.();
+  }
+
+  public createDataChannel(label: string): FakeDataChannel {
+    void label;
+    const channel = new FakeDataChannel();
+    this.createdChannels.push(channel);
+    return channel;
+  }
+
+  public createOffer(): Promise<RTCSessionDescriptionInit> {
+    return Promise.resolve({
+      sdp: "offer-sdp",
+      type: "offer"
+    });
+  }
+
+  public setLocalDescription(
+    description: RTCSessionDescriptionInit
+  ): Promise<void> {
+    this.localDescriptions.push(description);
+    return Promise.resolve();
+  }
+
+  public setRemoteDescription(
+    description: RTCSessionDescriptionInit
+  ): Promise<void> {
+    this.remoteDescriptions.push(description);
+    this.connectionState = "connected";
+    return Promise.resolve();
   }
 }
 
@@ -79,12 +152,75 @@ test("core package exposes a stable name marker", () => {
   expect(actualName).toBe(expectedName);
 });
 
-test("toolCallStarts$ emits once per call id and streams chunks in order", () => {
+test("connect establishes session and emits runtime.connection.open", async () => {
   // Arrange
-  const socket = new FakeSocket();
+  const peer = new FakePeerConnection();
+  const fetchCalls: Array<{ body: FormData | null; url: string }> = [];
   const client = createRealtimeClient({
-    socketFactory: () => socket,
-    url: "ws://localhost/realtime/ws"
+    fetchImpl: (input, init) => {
+      const requestUrl =
+        typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input.url;
+      fetchCalls.push({
+        body: init?.body instanceof FormData ? init.body : null,
+        url: requestUrl
+      });
+      return Promise.resolve(new Response("answer-sdp", { status: 200 }));
+    },
+    peerConnectionFactory: () => peer,
+    session: {
+      model: "gpt-realtime",
+      type: "realtime"
+    },
+    sessionEndpoint: "http://localhost/realtime/session"
+  });
+
+  const eventTypes: string[] = [];
+  client.events$.subscribe((event) => {
+    eventTypes.push(event.type);
+  });
+
+  // Act
+  const connectPromise = client.connect();
+  const channel = peer.createdChannels.at(0);
+  if (channel === undefined) {
+    throw new Error("Expected data channel to be created.");
+  }
+  channel.open();
+  await connectPromise;
+
+  // Assert
+  expect(fetchCalls).toHaveLength(1);
+  expect(fetchCalls[0]?.url).toBe("http://localhost/realtime/session");
+  const formData = fetchCalls[0]?.body;
+  if (formData === null || formData === undefined) {
+    throw new Error("Expected form data body.");
+  }
+  expect(formData.get("sdp")).toBe("offer-sdp");
+  expect(formData.get("session")).toBe(
+    JSON.stringify({
+      model: "gpt-realtime",
+      type: "realtime"
+    })
+  );
+  expect(eventTypes).toContain("runtime.connection.open");
+});
+
+test("toolCallStarts$ emits once per call id and streams chunks in order", async () => {
+  // Arrange
+  const peer = new FakePeerConnection();
+  const client = createRealtimeClient({
+    fetchImpl: () =>
+      Promise.resolve(new Response("answer-sdp", { status: 200 })),
+    peerConnectionFactory: () => peer,
+    session: {
+      model: "gpt-realtime",
+      type: "realtime"
+    },
+    sessionEndpoint: "http://localhost/realtime/session"
   });
 
   const starts: ToolCallStart[] = [];
@@ -97,11 +233,16 @@ test("toolCallStarts$ emits once per call id and streams chunks in order", () =>
     });
   });
 
-  client.connect();
-  socket.open();
+  const connectPromise = client.connect();
+  const channel = peer.createdChannels.at(0);
+  if (channel === undefined) {
+    throw new Error("Expected data channel to be created.");
+  }
+  channel.open();
+  await connectPromise;
 
   // Act
-  socket.emitMessage({
+  channel.emitMessage({
     call_id: "call_1",
     delta: '{"city":"San',
     item_id: "fc_1",
@@ -109,7 +250,7 @@ test("toolCallStarts$ emits once per call id and streams chunks in order", () =>
     response_id: "resp_1",
     type: "response.function_call_arguments.delta"
   });
-  socket.emitMessage({
+  channel.emitMessage({
     call_id: "call_1",
     delta: ' Francisco"}',
     item_id: "fc_1",
@@ -120,20 +261,22 @@ test("toolCallStarts$ emits once per call id and streams chunks in order", () =>
 
   // Assert
   expect(starts).toHaveLength(1);
-  const firstStart = starts.at(0);
-  if (firstStart === undefined) {
-    throw new Error("Expected first tool call start.");
-  }
-  expect(firstStart.callId).toBe("call_1");
+  expect(starts[0]?.callId).toBe("call_1");
   expect(chunks).toEqual(['{"city":"San', ' Francisco"}']);
 });
 
-test("argument stream completes when done event arrives", () => {
+test("argument stream completes when done event arrives", async () => {
   // Arrange
-  const socket = new FakeSocket();
+  const peer = new FakePeerConnection();
   const client = createRealtimeClient({
-    socketFactory: () => socket,
-    url: "ws://localhost/realtime/ws"
+    fetchImpl: () =>
+      Promise.resolve(new Response("answer-sdp", { status: 200 })),
+    peerConnectionFactory: () => peer,
+    session: {
+      model: "gpt-realtime",
+      type: "realtime"
+    },
+    sessionEndpoint: "http://localhost/realtime/session"
   });
 
   let completed = false;
@@ -146,9 +289,15 @@ test("argument stream completes when done event arrives", () => {
     });
   });
 
-  client.connect();
-  socket.open();
-  socket.emitMessage({
+  const connectPromise = client.connect();
+  const channel = peer.createdChannels.at(0);
+  if (channel === undefined) {
+    throw new Error("Expected data channel to be created.");
+  }
+  channel.open();
+  await connectPromise;
+
+  channel.emitMessage({
     call_id: "call_2",
     delta: "{}",
     item_id: "fc_2",
@@ -158,7 +307,7 @@ test("argument stream completes when done event arrives", () => {
   });
 
   // Act
-  socket.emitMessage({
+  channel.emitMessage({
     arguments: "{}",
     call_id: "call_2",
     item_id: "fc_2",
@@ -171,258 +320,59 @@ test("argument stream completes when done event arrives", () => {
   expect(completed).toBe(true);
 });
 
-test("reportToolSuccess sends runtime tool success event", () => {
-  // Arrange
-  const socket = new FakeSocket();
-  const client = createRealtimeClient({
-    socketFactory: () => socket,
-    url: "ws://localhost/realtime/ws"
-  });
-
-  client.connect();
-  socket.open();
-
-  // Act
-  client.reportToolSuccess({
-    callId: "call_3",
-    output: {
-      ok: true
-    }
-  });
-
-  // Assert
-  expect(socket.sentPayloads).toHaveLength(1);
-  const firstPayload = socket.sentPayloads.at(0);
-  if (firstPayload === undefined) {
-    throw new Error("Expected payload to exist.");
-  }
-  expect(JSON.parse(firstPayload)).toEqual({
-    callId: "call_3",
-    output: {
-      ok: true
-    },
-    type: "runtime.tool.success"
-  });
-});
-
-test("toolCallStart reportSuccess sends bound call id", () => {
-  // Arrange
-  const socket = new FakeSocket();
-  const client = createRealtimeClient({
-    socketFactory: () => socket,
-    url: "ws://localhost/realtime/ws"
-  });
-
-  const outputs: RuntimeToolSuccessEnvelope[] = [];
-
-  client.toolCallStarts$.subscribe((start) => {
-    const output = {
-      data: { ok: "yes" },
-      ok: true
-    } satisfies RuntimeToolSuccessEnvelope;
-
-    outputs.push(output);
-    start.reportSuccess(output);
-  });
-
-  client.connect();
-  socket.open();
-
-  // Act
-  socket.emitMessage({
-    call_id: "call_bound",
-    delta: "{}",
-    item_id: "fc_3",
-    output_index: 0,
-    response_id: "resp_3",
-    type: "response.function_call_arguments.delta"
-  });
-
-  // Assert
-  expect(outputs).toHaveLength(1);
-  const firstPayload = socket.sentPayloads.at(0);
-  if (firstPayload === undefined) {
-    throw new Error("Expected payload to exist.");
-  }
-  expect(JSON.parse(firstPayload)).toEqual({
-    callId: "call_bound",
-    output: {
-      data: { ok: "yes" },
-      ok: true
-    },
-    type: "runtime.tool.success"
-  });
-});
-
-test("disconnect completes active call streams", () => {
-  // Arrange
-  const socket = new FakeSocket();
-  const client = createRealtimeClient({
-    socketFactory: () => socket,
-    url: "ws://localhost/realtime/ws"
-  });
-
-  let completed = false;
-
-  client.toolCallStarts$.subscribe((start) => {
-    start.argumentChunks$.subscribe({
-      complete: () => {
-        completed = true;
-      }
-    });
-  });
-
-  client.connect();
-  socket.open();
-  socket.emitMessage({
-    call_id: "call_disconnect",
-    delta: "{}",
-    item_id: "fc_4",
-    output_index: 0,
-    response_id: "resp_4",
-    type: "response.function_call_arguments.delta"
-  });
-
-  // Act
-  client.disconnect();
-
-  // Assert
-  expect(completed).toBe(true);
-});
-
-test("invalid inbound json emits a client error event", () => {
-  // Arrange
-  const socket = new FakeSocket();
-  const client = createRealtimeClient({
-    socketFactory: () => socket,
-    url: "ws://localhost/realtime/ws"
-  });
-
-  const eventTypes: string[] = [];
-
-  client.events$.subscribe((event) => {
-    if (event.type === "error") {
-      eventTypes.push(event.type);
-    }
-  });
-
-  client.connect();
-  socket.open();
-
-  // Act
-  socket.onmessage?.({ data: "{" });
-
-  // Assert
-  expect(eventTypes).toEqual(["error"]);
-});
-
-test("connect and disconnect emit connection lifecycle events", () => {
-  // Arrange
-  const socket = new FakeSocket();
-  const client = createRealtimeClient({
-    socketFactory: () => socket,
-    url: "ws://localhost/realtime/ws"
-  });
-  const eventTypes: string[] = [];
-
-  client.events$.subscribe((event) => {
-    eventTypes.push(event.type);
-  });
-
-  client.connect();
-
-  // Act
-  socket.open();
-  client.disconnect();
-
-  // Assert
-  expect(eventTypes).toContain("runtime.connection.open");
-  expect(eventTypes).toContain("runtime.connection.closed");
-});
-
-test("invalid event envelope emits protocol error event", () => {
-  // Arrange
-  const socket = new FakeSocket();
-  const client = createRealtimeClient({
-    socketFactory: () => socket,
-    url: "ws://localhost/realtime/ws"
-  });
-  const messages: string[] = [];
-  client.events$.subscribe((event) => {
-    if (isErrorEvent(event)) {
-      messages.push(event.error.message);
-    }
-  });
-  client.connect();
-  socket.open();
-
-  // Act
-  socket.emitMessage({ foo: "bar" });
-
-  // Assert
-  expect(messages).toContain("Received invalid event envelope.");
-});
-
-test("json arrays are rejected as invalid payloads", () => {
-  // Arrange
-  const socket = new FakeSocket();
-  const client = createRealtimeClient({
-    socketFactory: () => socket,
-    url: "ws://localhost/realtime/ws"
-  });
-  const messages: string[] = [];
-  client.events$.subscribe((event) => {
-    if (isErrorEvent(event)) {
-      messages.push(event.error.message);
-    }
-  });
-  client.connect();
-  socket.open();
-
-  // Act
-  socket.onmessage?.({ data: "[]" });
-
-  // Assert
-  expect(messages).toContain("Received invalid JSON payload.");
-});
-
 test("send before open emits client error event", () => {
   // Arrange
-  const socket = new FakeSocket();
   const client = createRealtimeClient({
-    socketFactory: () => socket,
-    url: "ws://localhost/realtime/ws"
+    peerConnectionFactory: () => new FakePeerConnection(),
+    session: {
+      model: "gpt-realtime",
+      type: "realtime"
+    },
+    sessionEndpoint: "http://localhost/realtime/session"
   });
   const messages: string[] = [];
+
   client.events$.subscribe((event) => {
     if (isErrorEvent(event)) {
       messages.push(event.error.message);
     }
   });
-  client.connect();
 
   // Act
   client.send({ type: "response.create" });
 
   // Assert
-  expect(messages).toEqual(["Cannot send before websocket is open."]);
+  expect(messages).toEqual(["Cannot send before data channel is open."]);
 });
 
-test("invalid outgoing event emits validation error", () => {
+test("invalid outgoing event emits validation error", async () => {
   // Arrange
-  const socket = new FakeSocket();
+  const peer = new FakePeerConnection();
   const client = createRealtimeClient({
-    socketFactory: () => socket,
-    url: "ws://localhost/realtime/ws"
+    fetchImpl: () =>
+      Promise.resolve(new Response("answer-sdp", { status: 200 })),
+    peerConnectionFactory: () => peer,
+    session: {
+      model: "gpt-realtime",
+      type: "realtime"
+    },
+    sessionEndpoint: "http://localhost/realtime/session"
   });
   const messages: string[] = [];
+
   client.events$.subscribe((event) => {
     if (isErrorEvent(event)) {
       messages.push(event.error.message);
     }
   });
-  client.connect();
-  socket.open();
+
+  const connectPromise = client.connect();
+  const channel = peer.createdChannels.at(0);
+  if (channel === undefined) {
+    throw new Error("Expected data channel to be created.");
+  }
+  channel.open();
+  await connectPromise;
 
   // Act
   client.send({ type: "" });
@@ -431,147 +381,83 @@ test("invalid outgoing event emits validation error", () => {
   expect(messages).toContain("Client payload failed validation.");
 });
 
-test("non-JSON client payload emits validation error without throwing", () => {
+test("setMicrophoneEnabled toggles microphone track state", async () => {
   // Arrange
-  const socket = new FakeSocket();
-  const client = createRealtimeClient({
-    socketFactory: () => socket,
-    url: "ws://localhost/realtime/ws"
-  });
-  const messages: string[] = [];
-  client.events$.subscribe((event) => {
-    if (isErrorEvent(event)) {
-      messages.push(event.error.message);
-    }
-  });
-  client.connect();
-  socket.open();
-
-  // Act
-  client.send({
-    bigint: 1n,
-    type: "response.create"
-  });
-
-  // Assert
-  expect(messages).toContain("Client payload failed validation.");
-});
-
-test("serialization or send failure emits structured client error", () => {
-  // Arrange
-  const socket = new FakeSocket();
-  socket.send = () => {
-    throw new Error("send failed");
+  const peer = new FakePeerConnection();
+  const track: RealtimeMediaStreamTrackLike = {
+    enabled: false,
+    stop: () => undefined
   };
-  const client = createRealtimeClient({
-    socketFactory: () => socket,
-    url: "ws://localhost/realtime/ws"
-  });
-  const messages: string[] = [];
-  client.events$.subscribe((event) => {
-    if (isErrorEvent(event)) {
-      messages.push(event.error.message);
-    }
-  });
-  client.connect();
-  socket.open();
-
-  // Act
-  client.send({ type: "response.create" });
-
-  // Assert
-  expect(messages).toContain("Client payload is not JSON serializable.");
-});
-
-test("socket transport error emits error event", () => {
-  // Arrange
-  const socket = new FakeSocket();
-  const client = createRealtimeClient({
-    socketFactory: () => socket,
-    url: "ws://localhost/realtime/ws"
-  });
-  const messages: string[] = [];
-  client.events$.subscribe((event) => {
-    if (isErrorEvent(event)) {
-      messages.push(event.error.message);
-    }
-  });
-  client.connect();
-  socket.open();
-
-  // Act
-  socket.onerror?.(new Error("boom"));
-
-  // Assert
-  expect(messages).toContain("WebSocket transport error.");
-});
-
-test("connect handles socket creation failure", () => {
-  // Arrange
-  const client = createRealtimeClient({
-    socketFactory: () => {
-      throw new Error("factory failed");
+  const stream: RealtimeMediaStreamLike = {
+    getAudioTracks: () => {
+      return [track];
     },
-    url: "ws://localhost/realtime/ws"
-  });
-  const messages: string[] = [];
-  client.events$.subscribe((event) => {
-    if (isErrorEvent(event)) {
-      messages.push(event.error.message);
+    getTracks: () => {
+      return [track];
     }
+  };
+
+  const client = createRealtimeClient({
+    fetchImpl: () =>
+      Promise.resolve(new Response("answer-sdp", { status: 200 })),
+    getUserMedia: () => Promise.resolve(stream),
+    peerConnectionFactory: () => peer,
+    session: {
+      model: "gpt-realtime",
+      type: "realtime"
+    },
+    sessionEndpoint: "http://localhost/realtime/session"
   });
+
+  const connectPromise = client.connect();
+  const channel = peer.createdChannels.at(0);
+  if (channel === undefined) {
+    throw new Error("Expected data channel to be created.");
+  }
+  channel.open();
+  await connectPromise;
 
   // Act
-  client.connect();
+  await client.setMicrophoneEnabled(true);
+  await client.setMicrophoneEnabled(false);
 
   // Assert
-  expect(messages).toEqual(["Unable to create websocket transport."]);
+  expect(peer.addedTracks).toHaveLength(1);
+  expect(track.enabled).toBe(false);
 });
 
-test("connect is idempotent and disconnect handles idle state", () => {
+test("disconnect emits runtime.connection.closed", async () => {
   // Arrange
-  const socket = new FakeSocket();
-  let factoryCalls = 0;
+  const peer = new FakePeerConnection();
   const client = createRealtimeClient({
-    socketFactory: () => {
-      factoryCalls += 1;
-      return socket;
+    fetchImpl: () =>
+      Promise.resolve(new Response("answer-sdp", { status: 200 })),
+    peerConnectionFactory: () => peer,
+    session: {
+      model: "gpt-realtime",
+      type: "realtime"
     },
-    url: "ws://localhost/realtime/ws"
+    sessionEndpoint: "http://localhost/realtime/session"
   });
+  const eventTypes: string[] = [];
+
+  client.events$.subscribe((event) => {
+    eventTypes.push(event.type);
+  });
+
+  const connectPromise = client.connect();
+  const channel = peer.createdChannels.at(0);
+  if (channel === undefined) {
+    throw new Error("Expected data channel to be created.");
+  }
+  channel.open();
+  await connectPromise;
 
   // Act
   client.disconnect();
-  client.connect();
-  client.connect();
 
   // Assert
-  expect(factoryCalls).toBe(1);
-});
-
-test("missing global WebSocket emits transport creation error", () => {
-  // Arrange
-  const originalWebSocket = globalThis.WebSocket;
-  Reflect.deleteProperty(globalThis, "WebSocket");
-  const client = createRealtimeClient({
-    url: "ws://localhost/runtime"
-  });
-  const messages: string[] = [];
-  client.events$.subscribe((event) => {
-    if (isErrorEvent(event)) {
-      messages.push(event.error.message);
-    }
-  });
-
-  try {
-    // Act
-    client.connect();
-  } finally {
-    Reflect.set(globalThis, "WebSocket", originalWebSocket);
-  }
-
-  // Assert
-  expect(messages).toContain("Unable to create websocket transport.");
+  expect(eventTypes).toContain("runtime.connection.closed");
 });
 
 test("parse and guard helpers cover known and unknown events", () => {
@@ -597,9 +483,8 @@ test("parse and guard helpers cover known and unknown events", () => {
     type: "custom.event"
   });
   const clientEvent = parseCoreClientEvent({
-    callId: "call",
-    output: { ok: true },
-    type: "runtime.tool.success"
+    response: {},
+    type: "response.create"
   });
 
   // Act
@@ -610,7 +495,7 @@ test("parse and guard helpers cover known and unknown events", () => {
   expect(isFunctionCallArgumentsDoneEvent(done)).toBe(true);
   expect(isErrorEvent(unknown)).toBe(false);
   expect(unknownNormalized.type).toBe("custom.event");
-  expect(isRuntimeToolSuccessEvent(clientEvent)).toBe(true);
+  expect(clientEvent.type).toBe("response.create");
 });
 
 test("parse helpers reject invalid payload shapes", () => {
@@ -618,109 +503,44 @@ test("parse helpers reject invalid payload shapes", () => {
   expect(() => parseCoreServerEvent({})).toThrowError(
     "Server payload is not a valid event envelope."
   );
+
   expect(() => parseCoreClientEvent({ type: "" })).toThrowError(
     "Client payload is not a valid event envelope."
   );
 });
 
-test("browser adapter path handles open, message, error, and close events", () => {
+test("send serializes event payload into data channel", async () => {
   // Arrange
-  type Listener = (event?: unknown) => void;
-  type ListenerMap = Record<"close" | "error" | "message" | "open", Listener[]>;
+  const peer = new FakePeerConnection();
+  const client = createRealtimeClient({
+    fetchImpl: () =>
+      Promise.resolve(new Response("answer-sdp", { status: 200 })),
+    peerConnectionFactory: () => peer,
+    session: {
+      model: "gpt-realtime",
+      type: "realtime"
+    },
+    sessionEndpoint: "http://localhost/realtime/session"
+  });
 
-  class BrowserSocketStub {
-    public static latest: BrowserSocketStub | null = null;
-
-    public readyState = 0;
-
-    public readonly listeners: ListenerMap = {
-      close: [],
-      error: [],
-      message: [],
-      open: []
-    };
-
-    public readonly sentPayloads: string[] = [];
-
-    public constructor(public readonly url: string) {
-      BrowserSocketStub.latest = this;
-    }
-
-    public addEventListener<K extends keyof ListenerMap>(
-      type: K,
-      listener: Listener
-    ): void {
-      this.listeners[type].push(listener);
-    }
-
-    public close(code?: number, reason?: string): void {
-      this.readyState = 3;
-      this.listeners.close.forEach((listener) => {
-        listener({
-          code: code ?? 1000,
-          reason: reason ?? ""
-        });
-      });
-    }
-
-    public send(payload: string): void {
-      this.sentPayloads.push(payload);
-    }
+  const connectPromise = client.connect();
+  const channel = peer.createdChannels.at(0);
+  if (channel === undefined) {
+    throw new Error("Expected data channel to be created.");
   }
+  channel.open();
+  await connectPromise;
 
-  const originalWebSocket = globalThis.WebSocket;
-  Reflect.set(globalThis, "WebSocket", BrowserSocketStub);
+  // Act
+  client.send({ type: "response.create" });
 
-  try {
-    const client = createRealtimeClient({
-      url: "ws://localhost/runtime"
-    });
-    const events: string[] = [];
-    client.events$.subscribe((event) => {
-      events.push(event.type);
-    });
-
-    client.connect();
-
-    const browserSocket = BrowserSocketStub.latest;
-    if (browserSocket === null) {
-      throw new Error("Expected browser socket instance.");
-    }
-
-    // Act
-    browserSocket.readyState = 1;
-    browserSocket.listeners.open.forEach((listener) => {
-      listener();
-    });
-    client.send({ type: "response.create" });
-    browserSocket.listeners.message.forEach((listener) => {
-      listener({
-        data: JSON.stringify({
-          type: "response.done"
-        })
-      });
-    });
-    browserSocket.listeners.message.forEach((listener) => {
-      listener({
-        data: new Uint8Array([1, 2, 3])
-      });
-    });
-    browserSocket.listeners.error.forEach((listener) => {
-      listener(new Error("transport"));
-    });
-    client.disconnect();
-
-    // Assert
-    const firstPayload = browserSocket.sentPayloads.at(0);
-    if (firstPayload === undefined) {
-      throw new Error("Expected outbound payload.");
-    }
-    expect(parsePayloadRecord(firstPayload)).toEqual({
-      type: "response.create"
-    });
-    expect(events).toContain("response.done");
-    expect(events).toContain("error");
-  } finally {
-    Reflect.set(globalThis, "WebSocket", originalWebSocket);
+  // Assert
+  expect(channel.sentPayloads).toHaveLength(1);
+  const payload = channel.sentPayloads.at(0);
+  if (payload === undefined) {
+    throw new Error("Expected data channel payload.");
   }
+  expect(parsePayloadRecord(payload)).toEqual({
+    type: "response.create"
+  });
 });

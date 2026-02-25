@@ -79,7 +79,7 @@ const taskListPropsSchema = z.object({
 });
 
 const demoServerConfigSchema = z.object({
-  realtimeWebSocketUrl: z.string().url()
+  realtimeSessionUrl: z.string().url()
 });
 
 const lookupOrderInputSchema = z.object({
@@ -166,22 +166,22 @@ const TaskList = (props: unknown): ReactElement => {
 };
 
 /**
- * Fetches and validates runtime websocket configuration from the demo server.
+ * Fetches and validates runtime session configuration from the demo server.
  *
  * @param serverHttpUrl HTTP URL of the demo server.
- * @returns Loading, error, and resolved websocket URL state.
+ * @returns Loading, error, and resolved session URL state.
  */
 const useDemoServerConfig = (
   serverHttpUrl: string
 ): {
   error?: string;
   isLoading: boolean;
-  realtimeWebSocketUrl?: string;
+  realtimeSessionUrl?: string;
 } => {
   const [state, setState] = useState<{
     error?: string;
     isLoading: boolean;
-    realtimeWebSocketUrl?: string;
+    realtimeSessionUrl?: string;
   }>({
     isLoading: true
   });
@@ -213,7 +213,7 @@ const useDemoServerConfig = (
       .then((config) => {
         setState({
           isLoading: false,
-          realtimeWebSocketUrl: config.realtimeWebSocketUrl
+          realtimeSessionUrl: config.realtimeSessionUrl
         });
       })
       .catch((error: unknown) => {
@@ -654,14 +654,14 @@ export const App = (): ReactElement => {
     );
   }
 
-  if (config.error !== undefined || config.realtimeWebSocketUrl === undefined) {
+  if (config.error !== undefined || config.realtimeSessionUrl === undefined) {
     return (
       <main className="app-shell">
         <section className="panel">
           <h1>Frenchfry Demo</h1>
           <p className="error-line">
             Failed to load server config:{" "}
-            {config.error ?? "Missing websocket URL."}
+            {config.error ?? "Missing session URL."}
           </p>
           <p className="muted">
             Expected server endpoint: {serverHttpUrl}/config
@@ -677,13 +677,17 @@ export const App = (): ReactElement => {
         <header className="hero">
           <h1>Frenchfry Voice + Generative UI Demo</h1>
           <p>
-            Runtime websocket: <code>{config.realtimeWebSocketUrl}</code>
+            Runtime session endpoint: <code>{config.realtimeSessionUrl}</code>
           </p>
         </header>
         <VoiceAgent
           genUi={[genUi]}
+          session={{
+            model: "gpt-realtime",
+            type: "realtime"
+          }}
+          sessionEndpoint={config.realtimeSessionUrl}
           tools={toolRegistrations.voiceAgentTools}
-          url={config.realtimeWebSocketUrl}
         >
           {() => {
             return (

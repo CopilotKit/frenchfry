@@ -8,7 +8,13 @@ const sourceFiles = ["**/*.ts", "**/*.tsx"];
 
 export default [
   {
-    ignores: ["**/dist/**", "**/*.d.ts", "coverage/**", "node_modules/**"]
+    ignores: [
+      "**/dist/**",
+      "**/*.d.ts",
+      "coverage/**",
+      "node_modules/**",
+      "skills/**"
+    ]
   },
   js.configs.recommended,
   {

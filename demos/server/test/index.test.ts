@@ -1,44 +1,10 @@
 import { expect, test } from "vitest";
-import type {
-  ClientSocket,
-  RuntimeNodeWebSocketAdapter
-} from "@frenchfryai/runtime";
 
 import {
   SERVER_DEMO_NAME,
   createDemoServerApp,
   resolveDemoServerConfig
 } from "../src/index";
-
-type Lifecycle = {
-  onClose: (event: unknown, socket: ClientSocket) => void;
-  onMessage: (
-    event: { data: string | ArrayBufferLike | Blob },
-    socket: ClientSocket
-  ) => void;
-  onOpen: (event: unknown, socket: ClientSocket) => void;
-};
-
-/**
- * Creates a node websocket adapter stub for deterministic server tests.
- *
- * @returns Adapter instance compatible with runtime registration.
- */
-const createNodeWebSocketAdapterStub = (): RuntimeNodeWebSocketAdapter => {
-  return {
-    injectWebSocket: () => {
-      return;
-    },
-    upgradeWebSocket: (
-      configure: (context: unknown) => Lifecycle
-    ): ((context: unknown) => Response) => {
-      void configure;
-      return () => {
-        return new Response("ok");
-      };
-    }
-  };
-};
 
 test("resolveDemoServerConfig parses required and default env values", () => {
   // Arrange
@@ -52,8 +18,7 @@ test("resolveDemoServerConfig parses required and default env values", () => {
   // Assert
   expect(result.port).toBe(8787);
   expect(result.host).toBe("0.0.0.0");
-  expect(result.proxyPath).toBe("/realtime/ws");
-  expect(result.openai.model).toBe("gpt-realtime");
+  expect(result.sessionPath).toBe("/realtime/session");
   expect(result.openai.apiKey).toBe("test-key");
 });
 
@@ -66,9 +31,8 @@ test("resolveDemoServerConfig supports explicit overrides", () => {
     OPENAI_API_KEY: "test-key",
     OPENAI_ORGANIZATION: "org_123",
     OPENAI_PROJECT: "proj_123",
-    OPENAI_REALTIME_BASE_URL: "wss://example.test/realtime",
-    OPENAI_REALTIME_MODEL: "gpt-realtime-preview",
-    REALTIME_PROXY_PATH: "/ws/demo"
+    OPENAI_REALTIME_CALLS_URL: "https://example.test/realtime/calls",
+    REALTIME_SESSION_PATH: "/session/demo"
   };
 
   // Act
@@ -77,10 +41,9 @@ test("resolveDemoServerConfig supports explicit overrides", () => {
   // Assert
   expect(result.port).toBe(9090);
   expect(result.host).toBe("127.0.0.1");
-  expect(result.proxyPath).toBe("/ws/demo");
+  expect(result.sessionPath).toBe("/session/demo");
   expect(result.appOrigin).toBe("http://localhost:5174");
-  expect(result.openai.baseUrl).toBe("wss://example.test/realtime");
-  expect(result.openai.model).toBe("gpt-realtime-preview");
+  expect(result.openai.callsUrl).toBe("https://example.test/realtime/calls");
   expect(result.openai.organization).toBe("org_123");
   expect(result.openai.project).toBe("proj_123");
 });
@@ -113,11 +76,7 @@ test("createDemoServerApp exposes health and runtime config routes", async () =>
   const config = resolveDemoServerConfig({
     OPENAI_API_KEY: "test-key"
   });
-  const appRegistration = createDemoServerApp(config, {
-    createUpstreamSocket: () => {
-      throw new Error("Upstream socket should not be created by HTTP routes.");
-    }
-  });
+  const appRegistration = createDemoServerApp(config);
 
   // Act
   const healthResponse = await appRegistration.app.request(
@@ -128,7 +87,7 @@ test("createDemoServerApp exposes health and runtime config routes", async () =>
   );
 
   // Assert
-  expect(appRegistration.path).toBe("/realtime/ws");
+  expect(appRegistration.path).toBe("/realtime/session");
   expect(appRegistration.packageName).toBe(SERVER_DEMO_NAME);
   expect(healthResponse.status).toBe(200);
   expect(await healthResponse.json()).toEqual({
@@ -138,20 +97,16 @@ test("createDemoServerApp exposes health and runtime config routes", async () =>
   });
   expect(configResponse.status).toBe(200);
   expect(await configResponse.json()).toEqual({
-    realtimeWebSocketUrl: "ws://localhost/realtime/ws"
+    realtimeSessionUrl: "http://localhost/realtime/session"
   });
 });
 
-test("createDemoServerApp resolves secure websocket URLs from https requests", async () => {
+test("createDemoServerApp resolves secure session URLs from https requests", async () => {
   // Arrange
   const config = resolveDemoServerConfig({
     OPENAI_API_KEY: "test-key"
   });
-  const appRegistration = createDemoServerApp(config, {
-    createUpstreamSocket: () => {
-      throw new Error("Upstream socket should not be created by HTTP routes.");
-    }
-  });
+  const appRegistration = createDemoServerApp(config);
 
   // Act
   const configResponse = await appRegistration.app.request(
@@ -160,24 +115,19 @@ test("createDemoServerApp resolves secure websocket URLs from https requests", a
 
   // Assert
   expect(await configResponse.json()).toEqual({
-    realtimeWebSocketUrl: "wss://voice.example.com/realtime/ws"
+    realtimeSessionUrl: "https://voice.example.com/realtime/session"
   });
 });
 
-test("createDemoServerApp accepts optional runtime and openai overrides", async () => {
+test("createDemoServerApp accepts optional log callback", async () => {
   // Arrange
   const config = resolveDemoServerConfig({
     OPENAI_API_KEY: "test-key",
     OPENAI_ORGANIZATION: "org_123",
     OPENAI_PROJECT: "proj_123",
-    OPENAI_REALTIME_BASE_URL: "wss://example.test/realtime"
+    OPENAI_REALTIME_CALLS_URL: "https://example.test/realtime/calls"
   });
   const appRegistration = createDemoServerApp(config, {
-    autoResponseAfterToolSuccess: false,
-    createNodeWebSocket: createNodeWebSocketAdapterStub,
-    createUpstreamSocket: () => {
-      throw new Error("Upstream socket should not be created by HTTP routes.");
-    },
     onLog: () => {
       return;
     }

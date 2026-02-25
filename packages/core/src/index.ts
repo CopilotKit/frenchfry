@@ -15,7 +15,6 @@ export {
   isErrorEvent,
   isFunctionCallArgumentsDeltaEvent,
   isFunctionCallArgumentsDoneEvent,
-  isRuntimeToolSuccessEvent,
   parseCoreClientEvent,
   parseCoreServerEvent,
   toUnknownServerEvent
@@ -40,10 +39,12 @@ export type {
   JsonValue,
   OpenAIClientEvent,
   RealtimeClient,
-  RuntimeToolSuccessEnvelope,
-  RuntimeToolSuccessEvent,
+  RealtimeDataChannelLike,
+  RealtimeMediaStreamLike,
+  RealtimeMediaStreamTrackLike,
+  RealtimePeerConnectionLike,
+  RealtimeSessionConfig,
+  RealtimeTrackEventLike,
   ToolCallStart,
-  ToolCallSuccessInput,
-  UnknownServerEvent,
-  WebSocketLike
+  UnknownServerEvent
 } from "./types";

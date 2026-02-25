@@ -1,3 +1,4 @@
+/* v8 ignore file */
 import type { Observable } from "rxjs";
 
 /**
@@ -62,31 +63,13 @@ export type ErrorEvent = {
 };
 
 /**
- * Represents server events consumed by the core runtime client.
+ * Represents server events consumed by the core realtime client.
  */
 export type CoreServerEvent =
   | ErrorEvent
   | FunctionCallArgumentsDeltaEvent
   | FunctionCallArgumentsDoneEvent
   | UnknownServerEvent;
-
-/**
- * Represents a structured tool success payload sent from core to runtime.
- */
-export type RuntimeToolSuccessEnvelope = {
-  data?: JsonValue;
-  meta?: JsonValue;
-  ok: true;
-};
-
-/**
- * Represents a convenience client event for reporting successful tool execution.
- */
-export type RuntimeToolSuccessEvent = {
-  callId: string;
-  output: RuntimeToolSuccessEnvelope;
-  type: "runtime.tool.success";
-};
 
 /**
  * Represents a generic pass-through client event envelope.
@@ -96,17 +79,9 @@ export type OpenAIClientEvent = {
 } & Record<string, unknown>;
 
 /**
- * Represents client events accepted by the runtime proxy connection.
+ * Represents client events accepted by the realtime data channel.
  */
-export type CoreClientEvent = OpenAIClientEvent | RuntimeToolSuccessEvent;
-
-/**
- * Represents input for reporting successful tool execution.
- */
-export type ToolCallSuccessInput = {
-  callId: string;
-  output: RuntimeToolSuccessEnvelope;
-};
+export type CoreClientEvent = OpenAIClientEvent;
 
 /**
  * Represents a discovered function call stream with call metadata and chunk observable.
@@ -115,44 +90,104 @@ export type ToolCallStart = {
   argumentChunks$: Observable<string>;
   callId: string;
   itemId: string;
-  reportSuccess: (output: RuntimeToolSuccessEnvelope) => void;
   responseId: string;
 };
 
 /**
- * Represents options for establishing a runtime websocket client connection.
+ * Represents the minimum data channel surface required by the core realtime client.
  */
-export type CreateRealtimeClientOptions = {
-  socketFactory?: (url: string) => WebSocketLike;
-  url: string;
-};
-
-/**
- * Represents the subset of WebSocket behavior required by the core runtime client.
- */
-export type WebSocketLike = {
-  close: (code?: number, reason?: string) => void;
-  onclose:
-    | ((event: {
-        code: number | undefined;
-        reason: string | undefined;
-      }) => void)
-    | null;
+export type RealtimeDataChannelLike = {
+  close: () => void;
+  onclose: (() => void) | null;
   onerror: ((event: unknown) => void) | null;
   onmessage: ((event: { data: string }) => void) | null;
   onopen: (() => void) | null;
-  readyState: number;
+  readyState: "closed" | "closing" | "connecting" | "open";
   send: (payload: string) => void;
 };
 
 /**
- * Represents the public API of the core runtime websocket client.
+ * Represents a minimal local media track used for microphone toggling.
+ */
+export type RealtimeMediaStreamTrackLike = {
+  enabled: boolean;
+  stop: () => void;
+};
+
+/**
+ * Represents a minimal local media stream used for microphone capture.
+ */
+export type RealtimeMediaStreamLike = {
+  getAudioTracks: () => RealtimeMediaStreamTrackLike[];
+  getTracks: () => RealtimeMediaStreamTrackLike[];
+};
+
+/**
+ * Represents a minimal remote track event used for remote audio streams.
+ */
+export type RealtimeTrackEventLike = {
+  streams: readonly MediaStream[];
+};
+
+/**
+ * Represents the minimum peer connection surface required by the core realtime client.
+ */
+export type RealtimePeerConnectionLike = {
+  addTrack: (
+    track: RealtimeMediaStreamTrackLike,
+    ...streams: RealtimeMediaStreamLike[]
+  ) => unknown;
+  close: () => void;
+  connectionState:
+    | "closed"
+    | "connected"
+    | "connecting"
+    | "disconnected"
+    | "failed"
+    | "new";
+  createDataChannel: (label: string) => RealtimeDataChannelLike;
+  createOffer: () => Promise<RTCSessionDescriptionInit>;
+  onconnectionstatechange: (() => void) | null;
+  ontrack: ((event: RealtimeTrackEventLike) => void) | null;
+  setLocalDescription: (
+    description: RTCSessionDescriptionInit
+  ) => Promise<void>;
+  setRemoteDescription: (
+    description: RTCSessionDescriptionInit
+  ) => Promise<void>;
+};
+
+/**
+ * Represents realtime session configuration sent to OpenAI call setup.
+ */
+export type RealtimeSessionConfig = {
+  model: string;
+  type: "realtime";
+} & Record<string, unknown>;
+
+/**
+ * Represents options for establishing a runtime realtime client connection.
+ */
+export type CreateRealtimeClientOptions = {
+  dataChannelLabel?: string;
+  fetchImpl?: typeof fetch;
+  getUserMedia?: (
+    constraints: MediaStreamConstraints
+  ) => Promise<RealtimeMediaStreamLike>;
+  peerConnectionFactory?: () => RealtimePeerConnectionLike;
+  session: RealtimeSessionConfig;
+  sessionEndpoint: string;
+};
+
+/**
+ * Represents the public API of the core runtime realtime client.
  */
 export type RealtimeClient = {
-  connect: () => void;
+  connect: () => Promise<void>;
   disconnect: () => void;
   events$: Observable<CoreServerEvent>;
-  reportToolSuccess: (input: ToolCallSuccessInput) => void;
+  remoteAudioStream$: Observable<MediaStream>;
   send: (event: CoreClientEvent) => void;
+  setMicrophoneEnabled: (enabled: boolean) => Promise<void>;
   toolCallStarts$: Observable<ToolCallStart>;
 };

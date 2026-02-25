@@ -1,20 +1,19 @@
-import { cors } from "hono/cors";
-import { Hono } from "hono";
 import { serve, type ServerType } from "@hono/node-server";
 import {
   RUNTIME_PACKAGE_NAME,
-  registerRealtimeProxy,
-  type RealtimeProxyRegistration,
-  type RuntimeRealtimeProxyOptions
+  registerRealtimeSessionRoute,
+  type RealtimeSessionRegistration,
+  type RuntimeRealtimeSessionOptions
 } from "@frenchfryai/runtime";
+import { Hono } from "hono";
+import { cors } from "hono/cors";
 import { z } from "zod";
 
 export const SERVER_DEMO_NAME = "@frenchfryai/demo-server";
 
 type OpenAiConfig = {
   apiKey: string;
-  baseUrl?: string;
-  model: string;
+  callsUrl?: string;
   organization?: string;
   project?: string;
 };
@@ -27,23 +26,20 @@ export type DemoServerConfig = {
   host: string;
   openai: OpenAiConfig;
   port: number;
-  proxyPath: string;
+  sessionPath: string;
 };
 
 /**
  * Represents optional runtime wiring overrides for tests and custom bootstrapping.
  */
 export type DemoServerAppOptions = {
-  autoResponseAfterToolSuccess?: boolean;
-  createNodeWebSocket?: RuntimeRealtimeProxyOptions["createNodeWebSocket"];
-  createUpstreamSocket?: RuntimeRealtimeProxyOptions["createUpstreamSocket"];
-  onLog?: RuntimeRealtimeProxyOptions["onLog"];
+  onLog?: RuntimeRealtimeSessionOptions["onLog"];
 };
 
 /**
- * Represents the created Hono app and websocket registration details.
+ * Represents the created Hono app and session registration details.
  */
-export type DemoServerAppRegistration = RealtimeProxyRegistration & {
+export type DemoServerAppRegistration = RealtimeSessionRegistration & {
   app: Hono;
   packageName: string;
 };
@@ -63,9 +59,8 @@ const environmentSchema = z.object({
   OPENAI_API_KEY: z.string().min(1),
   OPENAI_ORGANIZATION: z.string().min(1).optional(),
   OPENAI_PROJECT: z.string().min(1).optional(),
-  OPENAI_REALTIME_BASE_URL: z.string().url().optional(),
-  OPENAI_REALTIME_MODEL: z.string().min(1).default("gpt-realtime"),
-  REALTIME_PROXY_PATH: z.string().startsWith("/").default("/realtime/ws")
+  OPENAI_REALTIME_CALLS_URL: z.string().url().optional(),
+  REALTIME_SESSION_PATH: z.string().startsWith("/").default("/realtime/session")
 });
 
 /**
@@ -93,7 +88,6 @@ export const resolveDemoServerConfig = (
 
   const openAiConfig: OpenAiConfig = {
     apiKey: parsed.OPENAI_API_KEY,
-    model: parsed.OPENAI_REALTIME_MODEL,
     ...(parsed.OPENAI_ORGANIZATION === undefined
       ? {}
       : {
@@ -104,10 +98,10 @@ export const resolveDemoServerConfig = (
       : {
           project: parsed.OPENAI_PROJECT
         }),
-    ...(parsed.OPENAI_REALTIME_BASE_URL === undefined
+    ...(parsed.OPENAI_REALTIME_CALLS_URL === undefined
       ? {}
       : {
-          baseUrl: parsed.OPENAI_REALTIME_BASE_URL
+          callsUrl: parsed.OPENAI_REALTIME_CALLS_URL
         })
   };
 
@@ -116,16 +110,16 @@ export const resolveDemoServerConfig = (
     host: parsed.DEMO_SERVER_HOST,
     openai: openAiConfig,
     port: parsed.DEMO_SERVER_PORT,
-    proxyPath: parsed.REALTIME_PROXY_PATH
+    sessionPath: parsed.REALTIME_SESSION_PATH
   };
 };
 
 /**
- * Creates the Hono demo server app and registers the runtime realtime proxy.
+ * Creates the Hono demo server app and registers the runtime realtime session route.
  *
  * @param config Validated server configuration.
  * @param options Optional runtime adapter overrides.
- * @returns App instance and websocket registration details.
+ * @returns App instance and session registration details.
  */
 export const createDemoServerApp = (
   config: DemoServerConfig,
@@ -150,29 +144,14 @@ export const createDemoServerApp = (
 
   app.get("/config", (context) => {
     return context.json({
-      realtimeWebSocketUrl: resolveRealtimeWebSocketUrl(
+      realtimeSessionUrl: resolveRealtimeSessionUrl(
         context.req.url,
-        config.proxyPath
+        config.sessionPath
       )
     });
   });
 
-  const registration = registerRealtimeProxy(app, {
-    ...(options.autoResponseAfterToolSuccess === undefined
-      ? {}
-      : {
-          autoResponseAfterToolSuccess: options.autoResponseAfterToolSuccess
-        }),
-    ...(options.createNodeWebSocket === undefined
-      ? {}
-      : {
-          createNodeWebSocket: options.createNodeWebSocket
-        }),
-    ...(options.createUpstreamSocket === undefined
-      ? {}
-      : {
-          createUpstreamSocket: options.createUpstreamSocket
-        }),
+  const registration = registerRealtimeSessionRoute(app, {
     ...(options.onLog === undefined
       ? {}
       : {
@@ -180,12 +159,10 @@ export const createDemoServerApp = (
         }),
     openai: {
       apiKey: config.openai.apiKey,
-      includeBetaHeader: true,
-      model: config.openai.model,
-      ...(config.openai.baseUrl === undefined
+      ...(config.openai.callsUrl === undefined
         ? {}
         : {
-            baseUrl: config.openai.baseUrl
+            callsUrl: config.openai.callsUrl
           }),
       ...(config.openai.organization === undefined
         ? {}
@@ -198,19 +175,18 @@ export const createDemoServerApp = (
             project: config.openai.project
           })
     },
-    path: config.proxyPath
+    path: config.sessionPath
   });
 
   return {
     app,
-    injectWebSocket: registration.injectWebSocket,
     packageName: SERVER_DEMO_NAME,
     path: registration.path
   };
 };
 
 /**
- * Starts the demo server HTTP process and injects websocket handling.
+ * Starts the demo server HTTP process.
  *
  * @param config Validated server configuration.
  * @param options Optional runtime adapter overrides.
@@ -227,7 +203,6 @@ export const startDemoServer = (
     hostname: config.host,
     port: config.port
   });
-  registration.injectWebSocket(server);
 
   return {
     close: () => {
@@ -248,19 +223,19 @@ export const startDemoServer = (
 /* c8 ignore stop */
 
 /**
- * Resolves a websocket URL from a request URL and configured proxy path.
+ * Resolves an HTTP session URL from a request URL and configured path.
  *
  * @param requestUrl Absolute request URL.
- * @param proxyPath Proxy route path.
- * @returns Absolute websocket URL for demo clients.
+ * @param sessionPath Session route path.
+ * @returns Absolute HTTP URL for demo clients.
  */
-const resolveRealtimeWebSocketUrl = (
+const resolveRealtimeSessionUrl = (
   requestUrl: string,
-  proxyPath: string
+  sessionPath: string
 ): string => {
   const url = new URL(requestUrl);
-  const websocketProtocol = url.protocol === "https:" ? "wss:" : "ws:";
-  return `${websocketProtocol}//${url.host}${proxyPath}`;
+  const protocol = url.protocol === "https:" ? "https:" : "http:";
+  return `${protocol}//${url.host}${sessionPath}`;
 };
 
 /**
@@ -287,17 +262,16 @@ if (isMainModule(import.meta.url)) {
       console.info(`[${SERVER_DEMO_NAME}] ${message}${serializedDetails}`);
     }
   });
-  const server = serve({
+  serve({
     fetch: registration.app.fetch,
     hostname: config.host,
     port: config.port
   });
-  registration.injectWebSocket(server);
   console.info(
     `[${SERVER_DEMO_NAME}] listening on http://${config.host}:${config.port}`
   );
   console.info(
-    `[${SERVER_DEMO_NAME}] realtime websocket route ${registration.path}`
+    `[${SERVER_DEMO_NAME}] realtime session route ${registration.path}`
   );
 }
 /* c8 ignore stop */
