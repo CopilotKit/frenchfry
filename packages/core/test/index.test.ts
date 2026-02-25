@@ -301,7 +301,9 @@ test("invalid inbound json emits a client error event", () => {
   const eventTypes: string[] = [];
 
   client.events$.subscribe((event) => {
-    eventTypes.push(event.type);
+    if (event.type === "error") {
+      eventTypes.push(event.type);
+    }
   });
 
   client.connect();
@@ -312,6 +314,30 @@ test("invalid inbound json emits a client error event", () => {
 
   // Assert
   expect(eventTypes).toEqual(["error"]);
+});
+
+test("connect and disconnect emit connection lifecycle events", () => {
+  // Arrange
+  const socket = new FakeSocket();
+  const client = createRealtimeClient({
+    socketFactory: () => socket,
+    url: "ws://localhost/realtime/ws"
+  });
+  const eventTypes: string[] = [];
+
+  client.events$.subscribe((event) => {
+    eventTypes.push(event.type);
+  });
+
+  client.connect();
+
+  // Act
+  socket.open();
+  client.disconnect();
+
+  // Assert
+  expect(eventTypes).toContain("runtime.connection.open");
+  expect(eventTypes).toContain("runtime.connection.closed");
 });
 
 test("invalid event envelope emits protocol error event", () => {

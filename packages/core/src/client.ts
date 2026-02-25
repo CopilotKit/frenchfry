@@ -89,7 +89,9 @@ export const createRealtimeClient = (
     }
 
     socket.onopen = () => {
-      return;
+      eventsSubject.next({
+        type: "runtime.connection.open"
+      });
     };
 
     socket.onmessage = (message) => {
@@ -106,9 +108,14 @@ export const createRealtimeClient = (
       eventsSubject.next(createLocalErrorEvent("WebSocket transport error."));
     };
 
-    socket.onclose = () => {
+    socket.onclose = (event) => {
       completeCallStreams(callArgumentStreams);
       socket = null;
+      eventsSubject.next({
+        code: event.code,
+        reason: event.reason,
+        type: "runtime.connection.closed"
+      });
     };
   };
 
