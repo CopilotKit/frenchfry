@@ -87,6 +87,8 @@ export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
   const audioProcessorRef = useRef<ScriptProcessorNode | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const recordingActiveRef = useRef(false);
+  const outputAudioContextRef = useRef<AudioContext | null>(null);
+  const playbackQueueRef = useRef<Promise<void>>(Promise.resolve());
 
   /**
    * Applies a core server event to internal tracked tool-call state.
@@ -159,6 +161,81 @@ export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
     audioContextRef.current = null;
     recordingActiveRef.current = false;
   }, []);
+
+  /**
+   * Releases active browser audio-playback resources and resets playback queue ordering.
+   */
+  const cleanupVoiceOutputResources = useCallback((): void => {
+    const outputAudioContext = outputAudioContextRef.current;
+    if (outputAudioContext !== null) {
+      void outputAudioContext.close();
+    }
+    outputAudioContextRef.current = null;
+    playbackQueueRef.current = Promise.resolve();
+  }, []);
+
+  /**
+   * Creates or reuses the output audio context used for assistant speech playback.
+   *
+   * @returns Output audio context or `null` when unsupported.
+   */
+  const ensureOutputAudioContext = useCallback((): AudioContext | null => {
+    if (outputAudioContextRef.current !== null) {
+      return outputAudioContextRef.current;
+    }
+
+    if (typeof AudioContext === "undefined") {
+      return null;
+    }
+
+    const outputAudioContext = new AudioContext();
+    outputAudioContextRef.current = outputAudioContext;
+    return outputAudioContext;
+  }, []);
+
+  /**
+   * Queues a PCM16 assistant audio chunk for sequential playback.
+   *
+   * @param input Audio chunk payload and sample-rate metadata.
+   */
+  const queueAssistantAudioChunk = useCallback(
+    (input: { base64Audio: string; sampleRateHz: number }): void => {
+      const outputAudioContext = ensureOutputAudioContext();
+      if (outputAudioContext === null) {
+        return;
+      }
+
+      const samples = decodePcm16Base64(input.base64Audio);
+      if (samples.length === 0) {
+        return;
+      }
+
+      playbackQueueRef.current = playbackQueueRef.current
+        .then(async () => {
+          const currentContext = outputAudioContextRef.current;
+          if (currentContext === null) {
+            return;
+          }
+
+          if (currentContext.state === "suspended") {
+            await currentContext.resume();
+          }
+
+          await playMonoPcmChunk({
+            audioContext: currentContext,
+            samples,
+            sampleRateHz: input.sampleRateHz
+          });
+        })
+        .catch(() => {
+          setLastError({
+            message: "Assistant audio playback failed.",
+            type: "voice_output_error"
+          });
+        });
+    },
+    [ensureOutputAudioContext]
+  );
 
   /**
    * Sends all generated client events through the active realtime client.
@@ -254,8 +331,17 @@ export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
 
         if (event.type === "runtime.connection.closed") {
           cleanupVoiceInputResources();
+          cleanupVoiceOutputResources();
           setVoiceInputStatus("idle");
           setStatus("idle");
+          return;
+        }
+
+        if (isResponseAudioDeltaEvent(event)) {
+          queueAssistantAudioChunk({
+            base64Audio: event.delta,
+            sampleRateHz: event.sample_rate_hz ?? 24000
+          });
           return;
         }
 
@@ -299,17 +385,20 @@ export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
   }, [
     applyAccumulatorEvent,
     cleanupVoiceInputResources,
+    cleanupVoiceOutputResources,
     executeToolCall,
     props.genUi,
+    queueAssistantAudioChunk,
     realtimeClient
   ]);
 
   useEffect(() => {
     return (): void => {
       cleanupVoiceInputResources();
+      cleanupVoiceOutputResources();
       realtimeClient.disconnect();
     };
-  }, [cleanupVoiceInputResources, realtimeClient]);
+  }, [cleanupVoiceInputResources, cleanupVoiceOutputResources, realtimeClient]);
 
   /**
    * Starts the voice agent websocket session.
@@ -424,7 +513,7 @@ export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
       });
       realtimeClient.send({
         response: {
-          modalities: ["text"]
+          modalities: ["audio", "text"]
         },
         type: "response.create"
       });
@@ -439,12 +528,13 @@ export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
     stopVoiceInput({
       commit: false
     });
+    cleanupVoiceOutputResources();
     setStatus("stopping");
     realtimeClient.disconnect();
     setActiveCallsById({});
     accumulatorStateRef.current = createToolCallAccumulatorState();
     setStatus("idle");
-  }, [realtimeClient, stopVoiceInput]);
+  }, [cleanupVoiceOutputResources, realtimeClient, stopVoiceInput]);
 
   /**
    * Sends a client event to the runtime websocket session.
@@ -592,6 +682,125 @@ const encodePcm16Base64 = (input: Float32Array): string => {
   }
 
   return btoa(binary);
+};
+
+/**
+ * Decodes base64 PCM16 mono bytes into float32 samples in range [-1, 1].
+ *
+ * @param base64Audio Base64-encoded PCM16 little-endian bytes.
+ * @returns Decoded mono samples.
+ */
+const decodePcm16Base64 = (base64Audio: string): Float32Array => {
+  if (base64Audio.length === 0) {
+    return new Float32Array(0);
+  }
+
+  try {
+    const bytes = decodeBase64Bytes(base64Audio);
+    const sampleCount = Math.floor(bytes.length / 2);
+    const output = new Float32Array(sampleCount);
+
+    for (let sampleIndex = 0; sampleIndex < sampleCount; sampleIndex += 1) {
+      const byteOffset = sampleIndex * 2;
+      const lowByte = bytes[byteOffset] ?? 0;
+      const highByte = bytes[byteOffset + 1] ?? 0;
+      const value = (highByte << 8) | lowByte;
+      const signed = value >= 0x8000 ? value - 0x10000 : value;
+      output[sampleIndex] = Math.max(-1, Math.min(1, signed / 32768));
+    }
+
+    return output;
+  } catch {
+    return new Float32Array(0);
+  }
+};
+
+/**
+ * Decodes a base64 string into raw bytes for runtime-compatible environments.
+ *
+ * @param base64Text Base64 string.
+ * @returns Decoded bytes.
+ */
+const decodeBase64Bytes = (base64Text: string): Uint8Array => {
+  if (typeof atob === "function") {
+    const binary = atob(base64Text);
+    const bytes = new Uint8Array(binary.length);
+
+    for (let byteIndex = 0; byteIndex < binary.length; byteIndex += 1) {
+      bytes[byteIndex] = binary.charCodeAt(byteIndex);
+    }
+
+    return bytes;
+  }
+
+  if (typeof Buffer !== "undefined") {
+    return Uint8Array.from(Buffer.from(base64Text, "base64"));
+  }
+
+  throw new Error("No base64 decoder is available in this runtime.");
+};
+
+/**
+ * Plays a mono PCM chunk through an audio context and resolves after playback finishes.
+ *
+ * @param input Audio context, sample-rate, and mono sample data.
+ * @returns Promise resolved when source playback ends.
+ */
+const playMonoPcmChunk = (input: {
+  audioContext: AudioContext;
+  sampleRateHz: number;
+  samples: Float32Array;
+}): Promise<void> => {
+  return new Promise((resolve) => {
+    const audioBuffer = input.audioContext.createBuffer(
+      1,
+      input.samples.length,
+      input.sampleRateHz
+    );
+    const channelData = audioBuffer.getChannelData(0);
+    channelData.set(input.samples);
+
+    const sourceNode = input.audioContext.createBufferSource();
+    sourceNode.buffer = audioBuffer;
+    sourceNode.connect(input.audioContext.destination);
+    sourceNode.onended = () => {
+      sourceNode.disconnect();
+      resolve();
+    };
+    sourceNode.start();
+  });
+};
+
+/**
+ * Type guard for assistant audio delta server events.
+ *
+ * @param event Core server event.
+ * @returns `true` when the event is an audio delta.
+ */
+const isResponseAudioDeltaEvent = (
+  event: CoreServerEvent
+): event is {
+  delta: string;
+  sample_rate_hz?: number;
+  type: "response.audio.delta";
+} => {
+  if (event.type !== "response.audio.delta") {
+    return false;
+  }
+
+  if (!("delta" in event) || typeof event.delta !== "string") {
+    return false;
+  }
+
+  if (
+    "sample_rate_hz" in event &&
+    event.sample_rate_hz !== undefined &&
+    typeof event.sample_rate_hz !== "number"
+  ) {
+    return false;
+  }
+
+  return true;
 };
 
 /**

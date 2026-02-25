@@ -247,19 +247,27 @@ const createSessionUpdateEvent = (
   tools: readonly SessionToolDefinition[]
 ): {
   session: {
-    modalities: ["text", "audio"];
+    modalities: ["audio", "text"];
     tool_choice: "auto";
     tools: readonly SessionToolDefinition[];
-    turn_detection: null;
+    turn_detection: {
+      create_response: true;
+      interrupt_response: true;
+      type: "server_vad";
+    };
   };
   type: "session.update";
 } => {
   return {
     session: {
-      modalities: ["text", "audio"],
+      modalities: ["audio", "text"],
       tool_choice: "auto",
       tools,
-      turn_detection: null
+      turn_detection: {
+        create_response: true,
+        interrupt_response: true,
+        type: "server_vad"
+      }
     },
     type: "session.update"
   };
@@ -457,19 +465,7 @@ const AgentConsole = (props: {
           }}
           type="button"
         >
-          Start Talking
-        </button>
-        <button
-          className="secondary"
-          disabled={voiceAgent.voiceInputStatus !== "recording"}
-          onClick={() => {
-            voiceAgent.stopVoiceInput({
-              commit: true
-            });
-          }}
-          type="button"
-        >
-          Stop + Send
+          Start Listening
         </button>
         <button
           className="secondary"
@@ -481,7 +477,7 @@ const AgentConsole = (props: {
           }}
           type="button"
         >
-          Cancel Capture
+          Stop Listening
         </button>
       </div>
       <h3>Active Tool Calls</h3>
