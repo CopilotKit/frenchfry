@@ -212,3 +212,67 @@ test("VoiceAgent stop disconnects realtime client", () => {
   expect(disconnectMock).toHaveBeenCalledTimes(1);
   expect(latest?.status).toBe("idle");
 });
+
+test("VoiceAgent auto-registers genUi session tool on connection open", () => {
+  // Arrange
+  sendMock.mockClear();
+  const onToolCallDelta = vi.fn();
+  const onToolCallDone = vi.fn();
+  const onToolCallStart = vi.fn();
+
+  render(
+    createElement(VoiceAgent, {
+      children: () => null,
+      genUi: [
+        {
+          id: "gen-ui-1",
+          onToolCallDelta,
+          onToolCallDone,
+          onToolCallStart,
+          orchestrationTool: {
+            description: "Render UI",
+            handler: () => Promise.resolve({ accepted: true }),
+            name: "render_ui"
+          },
+          sessionTool: {
+            description: "Render UI",
+            name: "render_ui",
+            parameters: {
+              type: "object"
+            },
+            type: "function"
+          }
+        }
+      ],
+      session: createSession(),
+      sessionEndpoint: "http://localhost/realtime/session",
+      tools: []
+    })
+  );
+
+  // Act
+  act(() => {
+    fakeRealtimeClient.events$.next({
+      type: "runtime.connection.open"
+    });
+  });
+
+  // Assert
+  expect(sendMock).toHaveBeenCalled();
+  expect(sendMock).toHaveBeenCalledWith({
+    session: {
+      tools: [
+        {
+          description: "Render UI",
+          name: "render_ui",
+          parameters: {
+            type: "object"
+          },
+          type: "function"
+        }
+      ],
+      type: "realtime"
+    },
+    type: "session.update"
+  });
+});

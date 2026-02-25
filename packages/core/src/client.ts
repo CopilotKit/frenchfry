@@ -17,6 +17,7 @@ import type {
   RealtimeClient,
   RealtimeDataChannelLike,
   RealtimePeerConnectionLike,
+  RealtimeTrackEventLike,
   ToolCallStart
 } from "./types";
 
@@ -36,6 +37,7 @@ export const createRealtimeClient = (
   const toolCallStartsSubject = new Subject<ToolCallStart>();
   const remoteAudioStreamSubject = new Subject<MediaStream>();
   const callArgumentStreams = new Map<string, Subject<string>>();
+  const callNameById = new Map<string, string>();
 
   let peerConnection: RealtimePeerConnectionLike | null = null;
   let dataChannel: RealtimeDataChannelLike | null = null;
@@ -85,14 +87,15 @@ export const createRealtimeClient = (
 
     const dataChannelOpenPromise = wireDataChannel({
       callArgumentStreams,
+      callNameById,
       dataChannel: nextDataChannel,
       eventsSubject,
       toolCallStartsSubject
     });
 
     nextPeerConnection.ontrack = (event) => {
-      const stream = event.streams.at(0);
-      if (stream !== undefined) {
+      const stream = resolveRemoteAudioStream(event);
+      if (stream !== null) {
         remoteAudioStreamSubject.next(stream);
       }
     };
@@ -105,6 +108,7 @@ export const createRealtimeClient = (
 
       teardownConnection({
         callArgumentStreams,
+        callNameById,
         dataChannel,
         eventsSubject,
         microphoneStream,
@@ -116,6 +120,20 @@ export const createRealtimeClient = (
       microphoneTrack = null;
       peerConnection = null;
     };
+
+    ensureAudioTransceiver(nextPeerConnection);
+    const initialMicrophone = await tryCreateMicrophoneTrack(
+      options,
+      eventsSubject
+    );
+    if (initialMicrophone !== null) {
+      nextPeerConnection.addTrack(
+        initialMicrophone.track,
+        initialMicrophone.stream
+      );
+      microphoneTrack = initialMicrophone.track;
+      microphoneStream = initialMicrophone.stream;
+    }
 
     const offer = await nextPeerConnection.createOffer();
     await nextPeerConnection.setLocalDescription(offer);
@@ -129,6 +147,7 @@ export const createRealtimeClient = (
     if (answerSdp === null) {
       teardownConnection({
         callArgumentStreams,
+        callNameById,
         dataChannel,
         eventsSubject,
         microphoneStream,
@@ -153,6 +172,7 @@ export const createRealtimeClient = (
   const disconnect = (): void => {
     teardownConnection({
       callArgumentStreams,
+      callNameById,
       dataChannel,
       eventsSubject,
       microphoneStream,
@@ -187,45 +207,17 @@ export const createRealtimeClient = (
       return;
     }
 
-    const getUserMedia = resolveGetUserMedia(options);
-    if (getUserMedia === null) {
-      eventsSubject.next(
-        createLocalErrorEvent(
-          "Microphone APIs are not available in this runtime."
-        )
-      );
+    const nextMicrophone = await tryCreateMicrophoneTrack(
+      options,
+      eventsSubject
+    );
+    if (nextMicrophone === null) {
       return;
     }
 
-    try {
-      const stream = await getUserMedia({
-        audio: {
-          channelCount: 1,
-          echoCancellation: true,
-          noiseSuppression: true
-        }
-      });
-      const track = stream.getAudioTracks().at(0);
-
-      if (track === undefined) {
-        eventsSubject.next(
-          createLocalErrorEvent(
-            "Microphone stream did not include an audio track."
-          )
-        );
-        stream.getTracks().forEach((streamTrack) => {
-          streamTrack.stop();
-        });
-        return;
-      }
-
-      track.enabled = true;
-      peerConnection.addTrack(track, stream);
-      microphoneTrack = track;
-      microphoneStream = stream;
-    } catch (error: unknown) {
-      eventsSubject.next(createLocalErrorEvent(toErrorMessage(error)));
-    }
+    peerConnection.addTrack(nextMicrophone.track, nextMicrophone.stream);
+    microphoneTrack = nextMicrophone.track;
+    microphoneStream = nextMicrophone.stream;
   };
 
   return {
@@ -241,11 +233,17 @@ export const createRealtimeClient = (
 
 type TeardownInput = {
   callArgumentStreams: Map<string, Subject<string>>;
+  callNameById: Map<string, string>;
   dataChannel: RealtimeDataChannelLike | null;
   eventsSubject: Subject<CoreServerEvent>;
   microphoneStream: RealtimeMediaStreamLike | null;
   microphoneTrack: RealtimeMediaStreamTrackLike | null;
   peerConnection: RealtimePeerConnectionLike | null;
+};
+
+type MicrophoneCaptureResult = {
+  stream: RealtimeMediaStreamLike;
+  track: RealtimeMediaStreamTrackLike;
 };
 
 /**
@@ -273,6 +271,7 @@ const teardownConnection = (input: TeardownInput): void => {
     track.stop();
   });
   completeCallStreams(input.callArgumentStreams);
+  input.callNameById.clear();
   input.eventsSubject.next({
     type: "runtime.connection.closed"
   });
@@ -305,6 +304,7 @@ const createPeerConnection = (
 
 type WireDataChannelInput = {
   callArgumentStreams: Map<string, Subject<string>>;
+  callNameById: Map<string, string>;
   dataChannel: RealtimeDataChannelLike;
   eventsSubject: Subject<CoreServerEvent>;
   toolCallStartsSubject: Subject<ToolCallStart>;
@@ -343,7 +343,8 @@ const wireDataChannel = (input: WireDataChannelInput): Promise<void> => {
         message.data,
         input.eventsSubject,
         input.toolCallStartsSubject,
-        input.callArgumentStreams
+        input.callArgumentStreams,
+        input.callNameById
       );
     };
   });
@@ -433,6 +434,94 @@ const resolveGetUserMedia = (
 };
 
 /**
+ * Attempts to capture and validate a local microphone track.
+ *
+ * @param options Client options.
+ * @param eventsSubject Event sink for local failures.
+ * @returns Validated track/stream pair, or `null` when microphone capture is unavailable.
+ */
+const tryCreateMicrophoneTrack = async (
+  options: CreateRealtimeClientOptions,
+  eventsSubject: Subject<CoreServerEvent>
+): Promise<MicrophoneCaptureResult | null> => {
+  const getUserMedia = resolveGetUserMedia(options);
+  if (getUserMedia === null) {
+    return null;
+  }
+
+  try {
+    const stream = await getUserMedia({
+      audio: {
+        channelCount: 1,
+        echoCancellation: true,
+        noiseSuppression: true
+      }
+    });
+    const track = stream.getAudioTracks().at(0);
+
+    if (track === undefined) {
+      eventsSubject.next(
+        createLocalErrorEvent(
+          "Microphone stream did not include an audio track."
+        )
+      );
+      stream.getTracks().forEach((streamTrack) => {
+        streamTrack.stop();
+      });
+      return null;
+    }
+
+    track.enabled = true;
+    return {
+      stream,
+      track
+    };
+  } catch (error: unknown) {
+    eventsSubject.next(createLocalErrorEvent(toErrorMessage(error)));
+    return null;
+  }
+};
+
+/**
+ * Resolves a remote audio stream from a WebRTC track event.
+ *
+ * @param event Peer connection track event.
+ * @returns Remote audio stream, or `null` when no compatible stream can be built.
+ */
+const resolveRemoteAudioStream = (
+  event: RealtimeTrackEventLike
+): MediaStream | null => {
+  const existingStream = event.streams.at(0);
+  if (existingStream !== undefined) {
+    return existingStream;
+  }
+
+  const track = event.track;
+  if (track === undefined || typeof MediaStream === "undefined") {
+    return null;
+  }
+
+  const stream = new MediaStream();
+  // Escape hatch: runtime track is structurally compatible with MediaStreamTrack
+  // and originates from browser RTCPeerConnection track events.
+  stream.addTrack(track as MediaStreamTrack);
+  return stream;
+};
+
+/**
+ * Adds an audio transceiver before offer creation so generated SDP always includes audio media.
+ *
+ * @param peerConnection Active peer connection.
+ */
+const ensureAudioTransceiver = (
+  peerConnection: RealtimePeerConnectionLike
+): void => {
+  peerConnection.addTransceiver?.("audio", {
+    direction: "recvonly"
+  });
+};
+
+/**
  * Creates a `RealtimePeerConnectionLike` adapter from native browser RTCPeerConnection.
  *
  * @param peerConnection Native RTCPeerConnection instance.
@@ -442,6 +531,9 @@ const createBrowserPeerConnectionAdapter = (
   peerConnection: RTCPeerConnection
 ): RealtimePeerConnectionLike => {
   const adapter: RealtimePeerConnectionLike = {
+    addTransceiver: (kind, options) => {
+      return peerConnection.addTransceiver(kind, options);
+    },
     addTrack: (track, ...streams) => {
       // Escape hatch: runtime supplies native MediaStreamTrack/MediaStream values, but
       // the core adapter surface intentionally models only the required subset.
@@ -480,7 +572,8 @@ const createBrowserPeerConnectionAdapter = (
 
   peerConnection.addEventListener("track", (event) => {
     adapter.ontrack?.({
-      streams: event.streams
+      streams: event.streams,
+      track: event.track
     });
   });
 
@@ -547,7 +640,8 @@ const handleIncomingMessage = (
   serialized: string,
   eventsSubject: Subject<CoreServerEvent>,
   toolCallStartsSubject: Subject<ToolCallStart>,
-  callArgumentStreams: Map<string, Subject<string>>
+  callArgumentStreams: Map<string, Subject<string>>,
+  callNameById: Map<string, string>
 ): void => {
   const parsedJson = parseJsonRecord(serialized);
 
@@ -567,34 +661,104 @@ const handleIncomingMessage = (
     return;
   }
 
-  if (isFunctionCallArgumentsDeltaEvent(event)) {
-    const existingStream = callArgumentStreams.get(event.call_id);
+  const addedMetadata = extractFunctionCallMetadata(parsedJson);
+  if (addedMetadata !== null) {
+    callNameById.set(addedMetadata.callId, addedMetadata.name);
+  }
+
+  const normalizedEvent = enrichDoneEventWithCallMetadata(event, callNameById);
+
+  if (isFunctionCallArgumentsDeltaEvent(normalizedEvent)) {
+    const existingStream = callArgumentStreams.get(normalizedEvent.call_id);
 
     if (existingStream === undefined) {
       const nextStream = new Subject<string>();
-      callArgumentStreams.set(event.call_id, nextStream);
+      callArgumentStreams.set(normalizedEvent.call_id, nextStream);
       toolCallStartsSubject.next({
         argumentChunks$: nextStream.asObservable(),
-        callId: event.call_id,
-        itemId: event.item_id,
-        responseId: event.response_id
+        callId: normalizedEvent.call_id,
+        itemId: normalizedEvent.item_id ?? normalizedEvent.call_id,
+        responseId: normalizedEvent.response_id ?? "unknown_response"
       });
-      nextStream.next(event.delta);
+      nextStream.next(normalizedEvent.delta);
     } else {
-      existingStream.next(event.delta);
+      existingStream.next(normalizedEvent.delta);
     }
   }
 
-  if (isFunctionCallArgumentsDoneEvent(event)) {
-    const stream = callArgumentStreams.get(event.call_id);
+  if (isFunctionCallArgumentsDoneEvent(normalizedEvent)) {
+    const stream = callArgumentStreams.get(normalizedEvent.call_id);
 
     if (stream !== undefined) {
       stream.complete();
-      callArgumentStreams.delete(event.call_id);
+      callArgumentStreams.delete(normalizedEvent.call_id);
     }
+    callNameById.delete(normalizedEvent.call_id);
   }
 
-  eventsSubject.next(event);
+  eventsSubject.next(normalizedEvent);
+};
+
+/**
+ * Extracts function call metadata from output-item-added events.
+ *
+ * @param payload Parsed event payload.
+ * @returns Call metadata, or `null` when payload does not contain function-call metadata.
+ */
+const extractFunctionCallMetadata = (
+  payload: Readonly<Record<string, unknown>>
+): { callId: string; name: string } | null => {
+  if (payload.type !== "response.output_item.added") {
+    return null;
+  }
+
+  const item = payload.item;
+  if (typeof item !== "object" || item === null) {
+    return null;
+  }
+
+  if (!("type" in item) || item.type !== "function_call") {
+    return null;
+  }
+
+  if (!("call_id" in item) || typeof item.call_id !== "string") {
+    return null;
+  }
+
+  if (!("name" in item) || typeof item.name !== "string") {
+    return null;
+  }
+
+  return {
+    callId: item.call_id,
+    name: item.name
+  };
+};
+
+/**
+ * Enriches function-call done events with previously observed call metadata.
+ *
+ * @param event Parsed server event.
+ * @param callNameById Known call-id to tool-name mapping.
+ * @returns Original event or enriched done event.
+ */
+const enrichDoneEventWithCallMetadata = (
+  event: CoreServerEvent,
+  callNameById: ReadonlyMap<string, string>
+): CoreServerEvent => {
+  if (!isFunctionCallArgumentsDoneEvent(event) || event.name !== undefined) {
+    return event;
+  }
+
+  const name = callNameById.get(event.call_id);
+  if (name === undefined) {
+    return event;
+  }
+
+  return {
+    ...event,
+    name
+  };
 };
 
 /**

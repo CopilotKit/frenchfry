@@ -141,3 +141,40 @@ test("createDemoServerApp accepts optional log callback", async () => {
   // Assert
   expect(healthResponse.status).toBe(200);
 });
+
+test("createDemoServerApp applies configured CORS policy to config and session routes", async () => {
+  // Arrange
+  const config = resolveDemoServerConfig({
+    DEMO_APP_ORIGIN: "http://localhost:5173",
+    OPENAI_API_KEY: "test-key"
+  });
+  const appRegistration = createDemoServerApp(config);
+
+  // Act
+  const configResponse = await appRegistration.app.request(
+    "http://localhost/config",
+    {
+      headers: {
+        origin: "http://localhost:5173"
+      }
+    }
+  );
+  const sessionResponse = await appRegistration.app.request(
+    "http://localhost/realtime/session",
+    {
+      headers: {
+        origin: "http://localhost:5173"
+      },
+      method: "POST"
+    }
+  );
+
+  // Assert
+  expect(configResponse.headers.get("access-control-allow-origin")).toBe(
+    "http://localhost:5173"
+  );
+  expect(sessionResponse.status).toBe(400);
+  expect(sessionResponse.headers.get("access-control-allow-origin")).toBe(
+    "http://localhost:5173"
+  );
+});

@@ -120,6 +120,127 @@ test("done events can omit name without setting optional field", () => {
   expect(afterDone.callsById.call_noname?.name).toBeUndefined();
 });
 
+test("accumulator falls back to call defaults when event metadata is omitted", () => {
+  // Arrange
+  const initial = createToolCallAccumulatorState();
+
+  // Act
+  const afterDelta = reduceToolCallAccumulatorState(
+    initial,
+    {
+      call_id: "call_minimal",
+      delta: '{"ui":[]}',
+      type: "response.function_call_arguments.delta"
+    },
+    10
+  );
+  const afterDone = reduceToolCallAccumulatorState(
+    afterDelta,
+    {
+      arguments: '{"ui":[]}',
+      call_id: "call_minimal",
+      type: "response.function_call_arguments.done"
+    },
+    20
+  );
+
+  // Assert
+  expect(afterDone.callsById.call_minimal).toEqual({
+    argumentText: '{"ui":[]}',
+    callId: "call_minimal",
+    doneArguments: '{"ui":[]}',
+    isDone: true,
+    itemId: "call_minimal",
+    responseId: "unknown_response",
+    updatedAtMs: 20
+  });
+});
+
+test("accumulator reuses previous metadata when later events omit metadata", () => {
+  // Arrange
+  const initial = createToolCallAccumulatorState();
+  const afterFirstDelta = reduceToolCallAccumulatorState(
+    initial,
+    {
+      call_id: "call_reuse",
+      delta: '{"ui":[',
+      item_id: "item_reuse",
+      response_id: "response_reuse",
+      type: "response.function_call_arguments.delta"
+    },
+    1
+  );
+
+  // Act
+  const afterSecondDelta = reduceToolCallAccumulatorState(
+    afterFirstDelta,
+    {
+      call_id: "call_reuse",
+      delta: "]}",
+      type: "response.function_call_arguments.delta"
+    },
+    2
+  );
+  const afterDone = reduceToolCallAccumulatorState(
+    afterSecondDelta,
+    {
+      arguments: '{"ui":[]}',
+      call_id: "call_reuse",
+      type: "response.function_call_arguments.done"
+    },
+    3
+  );
+
+  // Assert
+  expect(afterDone.callsById.call_reuse).toEqual({
+    argumentText: '{"ui":[]}',
+    callId: "call_reuse",
+    doneArguments: '{"ui":[]}',
+    isDone: true,
+    itemId: "item_reuse",
+    responseId: "response_reuse",
+    updatedAtMs: 3
+  });
+});
+
+test("accumulator uses mixed metadata sources when only part of done metadata is present", () => {
+  // Arrange
+  const initial = createToolCallAccumulatorState();
+  const afterDelta = reduceToolCallAccumulatorState(
+    initial,
+    {
+      call_id: "call_mixed",
+      delta: '{"ok":true}',
+      item_id: "item_from_delta",
+      type: "response.function_call_arguments.delta"
+    },
+    1
+  );
+
+  // Act
+  const afterDone = reduceToolCallAccumulatorState(
+    afterDelta,
+    {
+      arguments: '{"ok":true}',
+      call_id: "call_mixed",
+      response_id: "response_from_done",
+      type: "response.function_call_arguments.done"
+    },
+    2
+  );
+
+  // Assert
+  expect(afterDone.callsById.call_mixed).toEqual({
+    argumentText: '{"ok":true}',
+    callId: "call_mixed",
+    doneArguments: '{"ok":true}',
+    isDone: true,
+    itemId: "item_from_delta",
+    responseId: "response_from_done",
+    updatedAtMs: 2
+  });
+});
+
 test("accumulator returns original state for unrelated events", () => {
   // Arrange
   const initial = createToolCallAccumulatorState();
@@ -160,6 +281,26 @@ test("runToolInvocation returns unknown_tool when no tool exists", async () => {
   // Assert
   expect(result.status).toBe("unknown_tool");
   expect(result.output.ok).toBe(false);
+});
+
+test("runToolInvocation returns unknown_tool fallback name when tool name is missing", async () => {
+  // Arrange
+  const toolsByName = createToolRegistry([]);
+
+  // Act
+  const result = await runToolInvocation({
+    doneEvent: {
+      arguments: "{}",
+      call_id: "call_missing_name",
+      type: "response.function_call_arguments.done"
+    },
+    timeoutMs: 100,
+    toolsByName
+  });
+
+  // Assert
+  expect(result.status).toBe("unknown_tool");
+  expect(result.output.error?.message).toContain('"unknown"');
 });
 
 test("runToolInvocation returns invalid_arguments for malformed json", async () => {

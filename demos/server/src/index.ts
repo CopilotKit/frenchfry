@@ -126,13 +126,12 @@ export const createDemoServerApp = (
   options: DemoServerAppOptions = {}
 ): DemoServerAppRegistration => {
   const app = new Hono();
+  const corsOptions = {
+    origin: config.appOrigin
+  };
 
-  app.use(
-    "/config",
-    cors({
-      origin: config.appOrigin
-    })
-  );
+  app.use("/config", cors(corsOptions));
+  app.use(config.sessionPath, cors(corsOptions));
 
   app.get("/health", (context) => {
     return context.json({

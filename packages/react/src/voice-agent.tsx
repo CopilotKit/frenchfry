@@ -1,4 +1,5 @@
 import {
+  type OpenAIClientEvent,
   createFunctionCallOutputEvents,
   createRealtimeClient,
   createToolCallAccumulatorState,
@@ -11,6 +12,7 @@ import {
   type CoreClientEvent,
   type CoreServerEvent,
   type ErrorEvent,
+  type FunctionCallArgumentsDoneEvent,
   type OrchestrationTool,
   type ToolCallAccumulatorState
 } from "@frenchfryai/core";
@@ -48,6 +50,13 @@ export type VoiceAgentProps = {
   tools?: readonly OrchestrationTool[];
 };
 
+type SessionToolDefinition = {
+  description: string;
+  name: string;
+  parameters: unknown;
+  type: "function";
+};
+
 /**
  * Owns realtime WebRTC lifecycle, tool invocation loop, and render-prop state for voice sessions.
  *
@@ -56,6 +65,16 @@ export type VoiceAgentProps = {
  */
 export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
   const toolTimeoutMs = props.toolTimeoutMs ?? 15000;
+  const genUiSessionTools = useMemo<readonly SessionToolDefinition[]>(() => {
+    return props.genUi?.map((registration) => registration.sessionTool) ?? [];
+  }, [props.genUi]);
+
+  const genUiOrchestrationTools = useMemo(() => {
+    return (
+      props.genUi?.map((registration) => registration.orchestrationTool) ?? []
+    );
+  }, [props.genUi]);
+
   const realtimeClient = useMemo(() => {
     return createRealtimeClient({
       session: props.session,
@@ -64,8 +83,11 @@ export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
   }, [props.session, props.sessionEndpoint]);
 
   const toolRegistry = useMemo(() => {
-    return createToolRegistry(props.tools ?? []);
-  }, [props.tools]);
+    return createToolRegistry([
+      ...genUiOrchestrationTools,
+      ...(props.tools ?? [])
+    ]);
+  }, [genUiOrchestrationTools, props.tools]);
 
   const accumulatorStateRef = useRef<ToolCallAccumulatorState>(
     createToolCallAccumulatorState()
@@ -80,6 +102,7 @@ export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
   const [voiceInputStatus, setVoiceInputStatus] = useState<
     "idle" | "recording" | "unsupported"
   >("idle");
+  const [genUiToolsConfigured, setGenUiToolsConfigured] = useState(false);
   const [lastError, setLastError] = useState<
     | {
         message: string;
@@ -189,21 +212,47 @@ export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
     [realtimeClient]
   );
 
+  useEffect(() => {
+    if (status !== "running") {
+      setGenUiToolsConfigured(false);
+      return;
+    }
+
+    if (genUiToolsConfigured || genUiSessionTools.length === 0) {
+      return;
+    }
+
+    const existingSessionTools = extractSessionTools(props.session);
+    const mergedTools = dedupeToolsByName([
+      ...existingSessionTools,
+      ...genUiSessionTools
+    ]);
+
+    const sessionUpdateEvent = {
+      session: {
+        tools: mergedTools,
+        type: "realtime"
+      },
+      type: "session.update"
+    } satisfies OpenAIClientEvent;
+
+    sendEvents([sessionUpdateEvent]);
+    setGenUiToolsConfigured(true);
+  }, [
+    genUiSessionTools,
+    genUiToolsConfigured,
+    props.session,
+    sendEvents,
+    status
+  ]);
+
   /**
    * Executes a done tool call and sends its structured function-call-output response.
    *
    * @param event Done event payload.
    */
   const executeToolCall = useCallback(
-    async (event: {
-      arguments: string;
-      call_id: string;
-      item_id: string;
-      name?: string;
-      output_index: number;
-      response_id: string;
-      type: "response.function_call_arguments.done";
-    }): Promise<void> => {
+    async (event: FunctionCallArgumentsDoneEvent): Promise<void> => {
       setActiveCallsById((previous) => {
         const existing = previous[event.call_id];
 
@@ -264,8 +313,11 @@ export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
         }
 
         audioElement.srcObject = stream;
-        void audioElement.play().catch(() => {
-          return;
+        void audioElement.play().catch((error: unknown) => {
+          setLastError({
+            message: toErrorMessage(error),
+            type: "audio_playback_error"
+          });
         });
       })
     );
@@ -453,6 +505,69 @@ export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
       {props.children(renderState)}
     </VoiceAgentContext.Provider>
   );
+};
+
+/**
+ * Extracts any existing session tool definitions from a session payload.
+ *
+ * @param session Session payload from props.
+ * @returns Parsed session tool list.
+ */
+const extractSessionTools = (
+  session: VoiceAgentProps["session"]
+): readonly SessionToolDefinition[] => {
+  const tools = session.tools;
+  if (!Array.isArray(tools)) {
+    return [];
+  }
+
+  return tools.filter(isSessionToolDefinition);
+};
+
+/**
+ * Determines whether an unknown value is a session tool definition.
+ *
+ * @param value Unknown value.
+ * @returns True when value matches the session tool shape.
+ */
+const isSessionToolDefinition = (
+  value: unknown
+): value is SessionToolDefinition => {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+
+  if (!("description" in value) || !("name" in value)) {
+    return false;
+  }
+
+  if (!("parameters" in value) || !("type" in value)) {
+    return false;
+  }
+
+  return (
+    typeof value.description === "string" &&
+    typeof value.name === "string" &&
+    value.type === "function"
+  );
+};
+
+/**
+ * Deduplicates tools by name, keeping the last definition for each tool.
+ *
+ * @param tools Ordered tool list.
+ * @returns Deduplicated list preserving last-wins semantics.
+ */
+const dedupeToolsByName = (
+  tools: readonly SessionToolDefinition[]
+): readonly SessionToolDefinition[] => {
+  const byName = new Map<string, SessionToolDefinition>();
+
+  for (const tool of tools) {
+    byName.set(tool.name, tool);
+  }
+
+  return Array.from(byName.values());
 };
 
 /**

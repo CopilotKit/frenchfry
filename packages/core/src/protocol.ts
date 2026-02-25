@@ -35,9 +35,9 @@ const functionCallArgumentsDeltaEventSchema = z.object({
   call_id: z.string(),
   delta: z.string(),
   event_id: z.string().optional(),
-  item_id: z.string(),
-  output_index: z.number(),
-  response_id: z.string(),
+  item_id: z.string().optional(),
+  output_index: z.number().optional(),
+  response_id: z.string().optional(),
   type: z.literal("response.function_call_arguments.delta")
 });
 
@@ -45,11 +45,26 @@ const functionCallArgumentsDoneEventSchema = z.object({
   arguments: z.string(),
   call_id: z.string(),
   event_id: z.string().optional(),
-  item_id: z.string(),
+  item_id: z.string().optional(),
   name: z.string().optional(),
-  output_index: z.number(),
-  response_id: z.string(),
+  output_index: z.number().optional(),
+  response_id: z.string().optional(),
   type: z.literal("response.function_call_arguments.done")
+});
+
+const outputItemDoneFunctionCallEventSchema = z.object({
+  item: z
+    .object({
+      arguments: z.string(),
+      call_id: z.string(),
+      id: z.string().optional(),
+      name: z.string().optional(),
+      type: z.literal("function_call")
+    })
+    .passthrough(),
+  output_index: z.number().optional(),
+  response_id: z.string().optional(),
+  type: z.literal("response.output_item.done")
 });
 
 const unknownServerEventSchema = z
@@ -81,6 +96,29 @@ export const parseCoreServerEvent = (rawEvent: unknown): CoreServerEvent => {
 
   if (doneResult.success) {
     return doneResult.data;
+  }
+
+  const outputItemDoneResult =
+    outputItemDoneFunctionCallEventSchema.safeParse(rawEvent);
+
+  if (outputItemDoneResult.success) {
+    return {
+      arguments: outputItemDoneResult.data.item.arguments,
+      call_id: outputItemDoneResult.data.item.call_id,
+      ...(outputItemDoneResult.data.item.id === undefined
+        ? {}
+        : { item_id: outputItemDoneResult.data.item.id }),
+      ...(outputItemDoneResult.data.item.name === undefined
+        ? {}
+        : { name: outputItemDoneResult.data.item.name }),
+      ...(outputItemDoneResult.data.output_index === undefined
+        ? {}
+        : { output_index: outputItemDoneResult.data.output_index }),
+      ...(outputItemDoneResult.data.response_id === undefined
+        ? {}
+        : { response_id: outputItemDoneResult.data.response_id }),
+      type: "response.function_call_arguments.done"
+    };
   }
 
   const errorResult = errorEventSchema.safeParse(rawEvent);

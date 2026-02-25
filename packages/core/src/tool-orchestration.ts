@@ -286,8 +286,8 @@ const reduceDelta = (
     argumentText: `${previous?.argumentText ?? ""}${event.delta}`,
     callId: event.call_id,
     isDone: previous?.isDone ?? false,
-    itemId: event.item_id,
-    responseId: event.response_id,
+    itemId: event.item_id ?? previous?.itemId ?? event.call_id,
+    responseId: event.response_id ?? previous?.responseId ?? "unknown_response",
     updatedAtMs
   };
   const next: ToolCallAccumulatorEntry = {
@@ -326,8 +326,8 @@ const reduceDone = (
     callId: event.call_id,
     doneArguments: event.arguments,
     isDone: true,
-    itemId: event.item_id,
-    responseId: event.response_id,
+    itemId: event.item_id ?? previous?.itemId ?? event.call_id,
+    responseId: event.response_id ?? previous?.responseId ?? "unknown_response",
     updatedAtMs
   };
   const next: ToolCallAccumulatorEntry = {

@@ -28,9 +28,9 @@ export type FunctionCallArgumentsDeltaEvent = {
   call_id: string;
   delta: string;
   event_id?: string;
-  item_id: string;
-  output_index: number;
-  response_id: string;
+  item_id?: string;
+  output_index?: number;
+  response_id?: string;
   type: "response.function_call_arguments.delta";
 };
 
@@ -41,10 +41,10 @@ export type FunctionCallArgumentsDoneEvent = {
   arguments: string;
   call_id: string;
   event_id?: string;
-  item_id: string;
+  item_id?: string;
   name?: string;
-  output_index: number;
-  response_id: string;
+  output_index?: number;
+  response_id?: string;
   type: "response.function_call_arguments.done";
 };
 
@@ -127,12 +127,28 @@ export type RealtimeMediaStreamLike = {
  */
 export type RealtimeTrackEventLike = {
   streams: readonly MediaStream[];
+  track?: RealtimeMediaStreamTrackLike;
 };
+
+/**
+ * Represents supported transceiver directions used by the core realtime client.
+ */
+export type RealtimeTransceiverDirection =
+  | "inactive"
+  | "recvonly"
+  | "sendonly"
+  | "sendrecv";
 
 /**
  * Represents the minimum peer connection surface required by the core realtime client.
  */
 export type RealtimePeerConnectionLike = {
+  addTransceiver?: (
+    kind: "audio" | "video",
+    options?: {
+      direction?: RealtimeTransceiverDirection;
+    }
+  ) => unknown;
   addTrack: (
     track: RealtimeMediaStreamTrackLike,
     ...streams: RealtimeMediaStreamLike[]

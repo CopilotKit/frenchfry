@@ -47,21 +47,6 @@ const lookupOrderToolParameters: unknown = {
   type: "object"
 };
 
-const renderUiToolParameters: unknown = {
-  additionalProperties: true,
-  properties: {
-    ui: {
-      items: {
-        additionalProperties: true,
-        type: "object"
-      },
-      type: "array"
-    }
-  },
-  required: ["ui"],
-  type: "object"
-};
-
 const statusPillPropsSchema = z.object({
   label: z.string(),
   tone: z.enum(["critical", "healthy", "watch"])
@@ -84,10 +69,6 @@ const demoServerConfigSchema = z.object({
 
 const lookupOrderInputSchema = z.object({
   orderId: z.string().min(1)
-});
-
-const renderUiInputSchema = z.object({
-  ui: z.array(z.record(z.string(), z.unknown()))
 });
 
 const defaultServerHttpUrl = "http://localhost:8787";
@@ -238,42 +219,6 @@ const useDemoServerConfig = (
 };
 
 /**
- * Creates a session update event from runtime tool definitions.
- *
- * @param tools Session tool definitions exposed to the model.
- * @returns Session update event payload.
- */
-const createSessionUpdateEvent = (
-  tools: readonly SessionToolDefinition[]
-): {
-  session: {
-    modalities: ["audio", "text"];
-    tool_choice: "auto";
-    tools: readonly SessionToolDefinition[];
-    turn_detection: {
-      create_response: true;
-      interrupt_response: true;
-      type: "server_vad";
-    };
-  };
-  type: "session.update";
-} => {
-  return {
-    session: {
-      modalities: ["audio", "text"],
-      tool_choice: "auto",
-      tools,
-      turn_detection: {
-        create_response: true,
-        interrupt_response: true,
-        type: "server_vad"
-      }
-    },
-    type: "session.update"
-  };
-};
-
-/**
  * Creates an async delay that is abortable via `AbortSignal`.
  *
  * @param ms Delay in milliseconds.
@@ -314,14 +259,6 @@ const useVoiceAgentTools = (input: {
     ) => Promise<unknown>;
     name: string;
   };
-  renderUiTool: {
-    description: string;
-    handler: (
-      input: { ui: Record<string, unknown>[] },
-      abortSignal: AbortSignal
-    ) => Promise<unknown>;
-    name: string;
-  };
 }): {
   sessionTools: readonly SessionToolDefinition[];
   voiceAgentTools: readonly OrchestrationTool[];
@@ -333,15 +270,9 @@ const useVoiceAgentTools = (input: {
         name: input.lookupOrderEtaTool.name,
         parameters: lookupOrderToolParameters,
         type: "function"
-      },
-      {
-        description: input.renderUiTool.description,
-        name: input.renderUiTool.name,
-        parameters: renderUiToolParameters,
-        type: "function"
       }
     ];
-  }, [input.lookupOrderEtaTool, input.renderUiTool]);
+  }, [input.lookupOrderEtaTool]);
 
   const voiceAgentTools = useMemo<readonly OrchestrationTool[]>(() => {
     return [
@@ -361,27 +292,9 @@ const useVoiceAgentTools = (input: {
           return input.lookupOrderEtaTool.handler(parsed.data, abortSignal);
         },
         name: input.lookupOrderEtaTool.name
-      },
-      {
-        description: input.renderUiTool.description,
-        handler: async (
-          toolInput: unknown,
-          abortSignal: AbortSignal
-        ): Promise<unknown> => {
-          const parsed = renderUiInputSchema.safeParse(toolInput);
-          if (!parsed.success) {
-            return {
-              accepted: false,
-              reason: "Expected a Hashbrown UiWrapper payload."
-            };
-          }
-
-          return input.renderUiTool.handler(parsed.data, abortSignal);
-        },
-        name: input.renderUiTool.name
       }
     ];
-  }, [input.lookupOrderEtaTool, input.renderUiTool]);
+  }, [input.lookupOrderEtaTool]);
 
   return {
     sessionTools,
@@ -392,14 +305,10 @@ const useVoiceAgentTools = (input: {
 /**
  * Renders the interactive voice-first agent console.
  *
- * @param props Session tool definitions.
  * @returns Console UI element.
  */
-const AgentConsole = (props: {
-  sessionTools: readonly SessionToolDefinition[];
-}): ReactElement => {
+const AgentConsole = (): ReactElement => {
   const voiceAgent = useVoiceAgent();
-  const [sessionConfigured, setSessionConfigured] = useState(false);
 
   if (voiceAgent === null) {
     return (
@@ -411,18 +320,16 @@ const AgentConsole = (props: {
   }
 
   useEffect(() => {
-    if (voiceAgent.status !== "running") {
-      setSessionConfigured(false);
+    if (!voiceAgent.isRunning || voiceAgent.voiceInputStatus !== "idle") {
       return;
     }
 
-    if (sessionConfigured) {
-      return;
-    }
-
-    voiceAgent.sendEvent(createSessionUpdateEvent(props.sessionTools));
-    setSessionConfigured(true);
-  }, [props.sessionTools, sessionConfigured, voiceAgent]);
+    void voiceAgent.startVoiceInput();
+  }, [
+    voiceAgent.isRunning,
+    voiceAgent.startVoiceInput,
+    voiceAgent.voiceInputStatus
+  ]);
 
   return (
     <section className="panel">
@@ -600,7 +507,7 @@ export const App = (): ReactElement => {
   });
 
   const lookupOrderEtaTool = useTool({
-    deps: [],
+    deps: [appendLog],
     description:
       "Return ETA details for a delivery order when provided an order identifier.",
     handler: async (
@@ -608,6 +515,7 @@ export const App = (): ReactElement => {
       abortSignal: AbortSignal
     ): Promise<unknown> => {
       await waitFor(300, abortSignal);
+      appendLog("info", `Tool lookup_order_eta called for ${input.orderId}.`);
 
       return {
         confidence: "high",
@@ -622,25 +530,8 @@ export const App = (): ReactElement => {
     })
   });
 
-  const renderUiTool = useTool({
-    deps: [],
-    description:
-      "Accept generated UI payload and acknowledge render intent for the outlet.",
-    handler: (input: { ui: Record<string, unknown>[] }): Promise<unknown> => {
-      return Promise.resolve({
-        accepted: true,
-        componentCount: input.ui.length
-      });
-    },
-    name: "render_ui",
-    schema: s.object("UI wrapper payload.", {
-      ui: s.array("UI nodes array.", s.object("Arbitrary node payload.", {}))
-    })
-  });
-
   const toolRegistrations = useVoiceAgentTools({
-    lookupOrderEtaTool,
-    renderUiTool
+    lookupOrderEtaTool
   });
 
   if (config.isLoading) {
@@ -683,16 +574,31 @@ export const App = (): ReactElement => {
         <VoiceAgent
           genUi={[genUi]}
           session={{
+            audio: {
+              input: {
+                turn_detection: {
+                  create_response: true,
+                  interrupt_response: true,
+                  type: "server_vad"
+                }
+              },
+              output: {
+                voice: "marin"
+              }
+            },
+            instructions:
+              "You are a concise voice support agent. Use tools when they help answer the user.",
             model: "gpt-realtime",
+            output_modalities: ["audio"],
+            tool_choice: "auto",
+            tools: toolRegistrations.sessionTools,
             type: "realtime"
           }}
           sessionEndpoint={config.realtimeSessionUrl}
           tools={toolRegistrations.voiceAgentTools}
         >
           {() => {
-            return (
-              <AgentConsole sessionTools={toolRegistrations.sessionTools} />
-            );
+            return <AgentConsole />;
           }}
         </VoiceAgent>
         <section className="panel">

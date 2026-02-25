@@ -1,4 +1,5 @@
 import { type UiWrapper } from "@hashbrownai/core";
+import { type OrchestrationTool } from "@frenchfryai/core";
 import {
   type ExposedComponent,
   useJsonParser,
@@ -24,6 +25,13 @@ export type GenUiRegistration = {
   onToolCallDelta: (input: { callId: string; delta: string }) => void;
   onToolCallDone: (input: { callId: string; name?: string }) => void;
   onToolCallStart: (input: { callId: string }) => void;
+  orchestrationTool: OrchestrationTool;
+  sessionTool: {
+    description: string;
+    name: string;
+    parameters: unknown;
+    type: "function";
+  };
 };
 
 /**
@@ -32,6 +40,7 @@ export type GenUiRegistration = {
 export type UseGenUiOptions = {
   kit: UiKit<ExposedComponent<ComponentType<unknown>>>;
   outlet: string;
+  toolName?: string;
   toolNames?: readonly string[];
 };
 
@@ -42,6 +51,7 @@ export type UseGenUiOptions = {
  * @returns Registration object consumed by `VoiceAgent`.
  */
 export const useGenUi = (options: UseGenUiOptions): GenUiRegistration => {
+  const toolName = options.toolName ?? "render_ui";
   const uiBus = useContext(FrenchfryUiContext);
   const [activeCallId, setActiveCallId] = useState<string | null>(null);
   const [streamingJsonByCallId, setStreamingJsonByCallId] = useState<
@@ -153,13 +163,48 @@ export const useGenUi = (options: UseGenUiOptions): GenUiRegistration => {
   );
 
   return useMemo<GenUiRegistration>(() => {
+    const sessionTool = {
+      description:
+        "Render Hashbrown UiWrapper payload into the configured outlet.",
+      name: toolName,
+      parameters: {
+        additionalProperties: true,
+        properties: {
+          ui: {
+            items: {
+              additionalProperties: true,
+              type: "object"
+            },
+            type: "array"
+          }
+        },
+        required: ["ui"],
+        type: "object"
+      },
+      type: "function" as const
+    };
+
     return {
       id: registrationIdRef.current,
       onToolCallDelta,
       onToolCallDone,
-      onToolCallStart
+      onToolCallStart,
+      orchestrationTool: {
+        description: sessionTool.description,
+        handler: (input: unknown): Promise<unknown> => {
+          const accepted = isUiWrapper(input);
+          return Promise.resolve({
+            accepted,
+            ...(accepted
+              ? { componentCount: input.ui.length }
+              : { reason: "Expected UiWrapper payload with ui array." })
+          });
+        },
+        name: toolName
+      },
+      sessionTool
     };
-  }, [onToolCallDelta, onToolCallDone, onToolCallStart]);
+  }, [onToolCallDelta, onToolCallDone, onToolCallStart, toolName]);
 };
 
 /**

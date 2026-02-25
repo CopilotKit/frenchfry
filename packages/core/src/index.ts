@@ -45,6 +45,7 @@ export type {
   RealtimePeerConnectionLike,
   RealtimeSessionConfig,
   RealtimeTrackEventLike,
+  RealtimeTransceiverDirection,
   ToolCallStart,
   UnknownServerEvent
 } from "./types";

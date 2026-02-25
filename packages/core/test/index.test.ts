@@ -1,4 +1,4 @@
-import { expect, test } from "vitest";
+import { expect, test, vi } from "vitest";
 import { z } from "zod";
 
 import {
@@ -78,11 +78,32 @@ class FakePeerConnection implements RealtimePeerConnectionLike {
     stream: RealtimeMediaStreamLike;
     track: RealtimeMediaStreamTrackLike;
   }> = [];
+  public readonly addedTransceivers: Array<{
+    direction?: "inactive" | "recvonly" | "sendonly" | "sendrecv";
+    kind: "audio" | "video";
+  }> = [];
+  public readonly operationLog: string[] = [];
+
+  public addTransceiver(
+    kind: "audio" | "video",
+    options?: {
+      direction?: "inactive" | "recvonly" | "sendonly" | "sendrecv";
+    }
+  ): unknown {
+    const entry =
+      options?.direction === undefined
+        ? { kind }
+        : { direction: options.direction, kind };
+    this.addedTransceivers.push(entry);
+    this.operationLog.push("addTransceiver");
+    return {};
+  }
 
   public addTrack(
     track: RealtimeMediaStreamTrackLike,
     ...streams: RealtimeMediaStreamLike[]
   ): unknown {
+    this.operationLog.push("addTrack");
     const stream = streams.at(0);
     if (stream !== undefined) {
       this.addedTracks.push({ stream, track });
@@ -96,6 +117,10 @@ class FakePeerConnection implements RealtimePeerConnectionLike {
     this.onconnectionstatechange?.();
   }
 
+  public emitTrack(event: RealtimeTrackEventLike): void {
+    this.ontrack?.(event);
+  }
+
   public createDataChannel(label: string): FakeDataChannel {
     void label;
     const channel = new FakeDataChannel();
@@ -104,6 +129,7 @@ class FakePeerConnection implements RealtimePeerConnectionLike {
   }
 
   public createOffer(): Promise<RTCSessionDescriptionInit> {
+    this.operationLog.push("createOffer");
     return Promise.resolve({
       sdp: "offer-sdp",
       type: "offer"
@@ -209,6 +235,85 @@ test("connect establishes session and emits runtime.connection.open", async () =
   expect(eventTypes).toContain("runtime.connection.open");
 });
 
+test("connect configures an audio transceiver before creating the offer", async () => {
+  // Arrange
+  const peer = new FakePeerConnection();
+  const client = createRealtimeClient({
+    fetchImpl: () =>
+      Promise.resolve(new Response("answer-sdp", { status: 200 })),
+    peerConnectionFactory: () => peer,
+    session: {
+      model: "gpt-realtime",
+      type: "realtime"
+    },
+    sessionEndpoint: "http://localhost/realtime/session"
+  });
+
+  // Act
+  const connectPromise = client.connect();
+  const channel = peer.createdChannels.at(0);
+  if (channel === undefined) {
+    throw new Error("Expected data channel to be created.");
+  }
+  channel.open();
+  await connectPromise;
+
+  // Assert
+  expect(peer.addedTransceivers).toEqual([
+    {
+      direction: "recvonly",
+      kind: "audio"
+    }
+  ]);
+  expect(peer.operationLog).toEqual(["addTransceiver", "createOffer"]);
+});
+
+test("connect adds microphone track before creating the offer when available", async () => {
+  // Arrange
+  const peer = new FakePeerConnection();
+  const track: RealtimeMediaStreamTrackLike = {
+    enabled: false,
+    stop: () => undefined
+  };
+  const stream: RealtimeMediaStreamLike = {
+    getAudioTracks: () => {
+      return [track];
+    },
+    getTracks: () => {
+      return [track];
+    }
+  };
+  const client = createRealtimeClient({
+    fetchImpl: () =>
+      Promise.resolve(new Response("answer-sdp", { status: 200 })),
+    getUserMedia: () => Promise.resolve(stream),
+    peerConnectionFactory: () => peer,
+    session: {
+      model: "gpt-realtime",
+      type: "realtime"
+    },
+    sessionEndpoint: "http://localhost/realtime/session"
+  });
+
+  // Act
+  const connectPromise = client.connect();
+  const channel = peer.createdChannels.at(0);
+  if (channel === undefined) {
+    throw new Error("Expected data channel to be created.");
+  }
+  channel.open();
+  await connectPromise;
+
+  // Assert
+  expect(track.enabled).toBe(true);
+  expect(peer.addedTracks).toHaveLength(1);
+  expect(peer.operationLog).toEqual([
+    "addTransceiver",
+    "addTrack",
+    "createOffer"
+  ]);
+});
+
 test("toolCallStarts$ emits once per call id and streams chunks in order", async () => {
   // Arrange
   const peer = new FakePeerConnection();
@@ -263,6 +368,72 @@ test("toolCallStarts$ emits once per call id and streams chunks in order", async
   expect(starts).toHaveLength(1);
   expect(starts[0]?.callId).toBe("call_1");
   expect(chunks).toEqual(['{"city":"San', ' Francisco"}']);
+});
+
+test("remoteAudioStream$ emits stream built from track when ontrack has no stream list", async () => {
+  // Arrange
+  class FakeMediaStream {
+    public readonly tracks: RealtimeMediaStreamTrackLike[] = [];
+
+    public addTrack(track: RealtimeMediaStreamTrackLike): void {
+      this.tracks.push(track);
+    }
+  }
+
+  const originalMediaStream = globalThis.MediaStream;
+  vi.stubGlobal("MediaStream", FakeMediaStream);
+  try {
+    const peer = new FakePeerConnection();
+    const client = createRealtimeClient({
+      fetchImpl: () =>
+        Promise.resolve(new Response("answer-sdp", { status: 200 })),
+      peerConnectionFactory: () => peer,
+      session: {
+        model: "gpt-realtime",
+        type: "realtime"
+      },
+      sessionEndpoint: "http://localhost/realtime/session"
+    });
+
+    const emittedStreams: unknown[] = [];
+    client.remoteAudioStream$.subscribe((stream) => {
+      emittedStreams.push(stream);
+    });
+
+    const connectPromise = client.connect();
+    const channel = peer.createdChannels.at(0);
+    if (channel === undefined) {
+      throw new Error("Expected data channel to be created.");
+    }
+    channel.open();
+    await connectPromise;
+
+    const track: RealtimeMediaStreamTrackLike = {
+      enabled: true,
+      stop: () => undefined
+    };
+
+    // Act
+    peer.emitTrack({
+      streams: [],
+      track
+    });
+
+    // Assert
+    expect(emittedStreams).toHaveLength(1);
+    const emitted = emittedStreams[0];
+    expect(emitted).toBeInstanceOf(FakeMediaStream);
+    if (!(emitted instanceof FakeMediaStream)) {
+      throw new Error("Expected emitted fake media stream instance.");
+    }
+    expect(emitted.tracks).toEqual([track]);
+  } finally {
+    if (originalMediaStream === undefined) {
+      vi.unstubAllGlobals();
+    } else {
+      vi.stubGlobal("MediaStream", originalMediaStream);
+    }
+  }
 });
 
 test("argument stream completes when done event arrives", async () => {
@@ -486,6 +657,15 @@ test("parse and guard helpers cover known and unknown events", () => {
     response: {},
     type: "response.create"
   });
+  const normalizedOutputItemDone = parseCoreServerEvent({
+    item: {
+      arguments: '{"orderId":"abc123"}',
+      call_id: "call_from_output_item",
+      name: "lookup_order_eta",
+      type: "function_call"
+    },
+    type: "response.output_item.done"
+  });
 
   // Act
   const unknownNormalized = toUnknownServerEvent(unknown);
@@ -494,8 +674,148 @@ test("parse and guard helpers cover known and unknown events", () => {
   expect(isFunctionCallArgumentsDeltaEvent(delta)).toBe(true);
   expect(isFunctionCallArgumentsDoneEvent(done)).toBe(true);
   expect(isErrorEvent(unknown)).toBe(false);
+  expect(isFunctionCallArgumentsDoneEvent(normalizedOutputItemDone)).toBe(true);
+  if (!isFunctionCallArgumentsDoneEvent(normalizedOutputItemDone)) {
+    throw new Error("Expected normalized output-item done event.");
+  }
+  expect(normalizedOutputItemDone.call_id).toBe("call_from_output_item");
+  expect(normalizedOutputItemDone.name).toBe("lookup_order_eta");
   expect(unknownNormalized.type).toBe("custom.event");
   expect(clientEvent.type).toBe("response.create");
+});
+
+test("parseCoreServerEvent normalizes response.output_item.done with optional metadata", () => {
+  // Arrange
+  const rawEvent = {
+    item: {
+      arguments: '{"orderId":"abc123"}',
+      call_id: "call_full",
+      id: "item_full",
+      name: "lookup_order_eta",
+      type: "function_call"
+    },
+    output_index: 2,
+    response_id: "response_full",
+    type: "response.output_item.done"
+  };
+
+  // Act
+  const parsed = parseCoreServerEvent(rawEvent);
+
+  // Assert
+  expect(isFunctionCallArgumentsDoneEvent(parsed)).toBe(true);
+  if (!isFunctionCallArgumentsDoneEvent(parsed)) {
+    throw new Error("Expected function-call done event.");
+  }
+  expect(parsed).toEqual({
+    arguments: '{"orderId":"abc123"}',
+    call_id: "call_full",
+    item_id: "item_full",
+    name: "lookup_order_eta",
+    output_index: 2,
+    response_id: "response_full",
+    type: "response.function_call_arguments.done"
+  });
+});
+
+test("parseCoreServerEvent normalizes response.output_item.done without optional metadata", () => {
+  // Arrange
+  const rawEvent = {
+    item: {
+      arguments: "{}",
+      call_id: "call_minimal",
+      type: "function_call"
+    },
+    type: "response.output_item.done"
+  };
+
+  // Act
+  const parsed = parseCoreServerEvent(rawEvent);
+
+  // Assert
+  expect(isFunctionCallArgumentsDoneEvent(parsed)).toBe(true);
+  if (!isFunctionCallArgumentsDoneEvent(parsed)) {
+    throw new Error("Expected function-call done event.");
+  }
+  expect(parsed).toEqual({
+    arguments: "{}",
+    call_id: "call_minimal",
+    type: "response.function_call_arguments.done"
+  });
+});
+
+test("parseCoreServerEvent parses error envelopes as ErrorEvent", () => {
+  // Arrange
+  const rawEvent = {
+    error: {
+      message: "oops",
+      type: "server_error"
+    },
+    type: "error"
+  };
+
+  // Act
+  const parsed = parseCoreServerEvent(rawEvent);
+
+  // Assert
+  expect(isErrorEvent(parsed)).toBe(true);
+  if (!isErrorEvent(parsed)) {
+    throw new Error("Expected error event.");
+  }
+  expect(parsed.error.message).toBe("oops");
+});
+
+test("done event is enriched with tool name from output_item.added metadata", async () => {
+  // Arrange
+  const peer = new FakePeerConnection();
+  const client = createRealtimeClient({
+    fetchImpl: () =>
+      Promise.resolve(new Response("answer-sdp", { status: 200 })),
+    peerConnectionFactory: () => peer,
+    session: {
+      model: "gpt-realtime",
+      type: "realtime"
+    },
+    sessionEndpoint: "http://localhost/realtime/session"
+  });
+
+  const doneNames: string[] = [];
+  client.events$.subscribe((event) => {
+    if (isFunctionCallArgumentsDoneEvent(event) && event.name !== undefined) {
+      doneNames.push(event.name);
+    }
+  });
+
+  const connectPromise = client.connect();
+  const channel = peer.createdChannels.at(0);
+  if (channel === undefined) {
+    throw new Error("Expected data channel to be created.");
+  }
+  channel.open();
+  await connectPromise;
+
+  // Act
+  channel.emitMessage({
+    item: {
+      call_id: "call_meta",
+      name: "render_ui",
+      type: "function_call"
+    },
+    type: "response.output_item.added"
+  });
+  channel.emitMessage({
+    call_id: "call_meta",
+    delta: '{"ui":[]}',
+    type: "response.function_call_arguments.delta"
+  });
+  channel.emitMessage({
+    arguments: '{"ui":[]}',
+    call_id: "call_meta",
+    type: "response.function_call_arguments.done"
+  });
+
+  // Assert
+  expect(doneNames).toEqual(["render_ui"]);
 });
 
 test("parse helpers reject invalid payload shapes", () => {
