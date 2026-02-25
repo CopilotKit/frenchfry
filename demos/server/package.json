@@ -7,10 +7,13 @@
     "build": "tsc -b tsconfig.build.json",
     "dev": "tsx watch src/index.ts",
     "lint": "eslint src test",
-    "test": "vitest run test",
+    "test": "cd ../.. && vitest run demos/server/test/**/*.test.ts",
     "typecheck": "tsc -b tsconfig.json"
   },
   "dependencies": {
-    "@frenchfryai/runtime": "0.1.0"
+    "@frenchfryai/runtime": "0.1.0",
+    "@hono/node-server": "^1.19.5",
+    "hono": "^4.12.2",
+    "zod": "^4.3.6"
   }
 }

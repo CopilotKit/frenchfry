@@ -72,6 +72,9 @@ export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
   const [status, setStatus] = useState<
     "connecting" | "error" | "idle" | "running" | "stopping"
   >("idle");
+  const [voiceInputStatus, setVoiceInputStatus] = useState<
+    "idle" | "recording" | "unsupported"
+  >("idle");
   const [lastError, setLastError] = useState<
     | {
         message: string;
@@ -79,6 +82,11 @@ export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
       }
     | undefined
   >(undefined);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const audioSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const audioProcessorRef = useRef<ScriptProcessorNode | null>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const recordingActiveRef = useRef(false);
 
   /**
    * Applies a core server event to internal tracked tool-call state.
@@ -129,6 +137,28 @@ export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
     },
     []
   );
+
+  /**
+   * Releases active browser audio-capture resources.
+   */
+  const cleanupVoiceInputResources = useCallback((): void => {
+    audioProcessorRef.current?.disconnect();
+    audioSourceRef.current?.disconnect();
+
+    mediaStreamRef.current?.getTracks().forEach((track) => {
+      track.stop();
+    });
+
+    if (audioContextRef.current !== null) {
+      void audioContextRef.current.close();
+    }
+
+    audioProcessorRef.current = null;
+    audioSourceRef.current = null;
+    mediaStreamRef.current = null;
+    audioContextRef.current = null;
+    recordingActiveRef.current = false;
+  }, []);
 
   /**
    * Sends all generated client events through the active realtime client.
@@ -223,6 +253,8 @@ export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
         }
 
         if (event.type === "runtime.connection.closed") {
+          cleanupVoiceInputResources();
+          setVoiceInputStatus("idle");
           setStatus("idle");
           return;
         }
@@ -264,13 +296,20 @@ export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
     return (): void => {
       subscription.unsubscribe();
     };
-  }, [applyAccumulatorEvent, executeToolCall, props.genUi, realtimeClient]);
+  }, [
+    applyAccumulatorEvent,
+    cleanupVoiceInputResources,
+    executeToolCall,
+    props.genUi,
+    realtimeClient
+  ]);
 
   useEffect(() => {
     return (): void => {
+      cleanupVoiceInputResources();
       realtimeClient.disconnect();
     };
-  }, [realtimeClient]);
+  }, [cleanupVoiceInputResources, realtimeClient]);
 
   /**
    * Starts the voice agent websocket session.
@@ -282,15 +321,130 @@ export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
   }, [realtimeClient]);
 
   /**
+   * Starts microphone capture and streams PCM16 audio into the realtime session.
+   */
+  const startVoiceInput = useCallback(async (): Promise<void> => {
+    if (status !== "running") {
+      setLastError({
+        message: "Cannot start voice input before connection is running.",
+        type: "voice_input_error"
+      });
+      return;
+    }
+
+    if (voiceInputStatus === "recording") {
+      return;
+    }
+
+    if (
+      typeof navigator === "undefined" ||
+      navigator.mediaDevices === undefined ||
+      navigator.mediaDevices.getUserMedia === undefined ||
+      typeof AudioContext === "undefined"
+    ) {
+      setVoiceInputStatus("unsupported");
+      setLastError({
+        message: "Browser does not support required microphone APIs.",
+        type: "voice_input_unsupported"
+      });
+      return;
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          channelCount: 1,
+          echoCancellation: true,
+          noiseSuppression: true
+        }
+      });
+      const audioContext = new AudioContext();
+      const sourceNode = audioContext.createMediaStreamSource(stream);
+      const processorNode = audioContext.createScriptProcessor(4096, 1, 1);
+
+      processorNode.onaudioprocess = (event): void => {
+        if (!recordingActiveRef.current) {
+          return;
+        }
+
+        const sourceSamples = event.inputBuffer.getChannelData(0);
+        const downsampled = downsampleMonoPcm(
+          sourceSamples,
+          audioContext.sampleRate,
+          16000
+        );
+        const base64Audio = encodePcm16Base64(downsampled);
+
+        realtimeClient.send({
+          audio: base64Audio,
+          type: "input_audio_buffer.append"
+        });
+      };
+
+      sourceNode.connect(processorNode);
+      processorNode.connect(audioContext.destination);
+
+      mediaStreamRef.current = stream;
+      audioContextRef.current = audioContext;
+      audioSourceRef.current = sourceNode;
+      audioProcessorRef.current = processorNode;
+      recordingActiveRef.current = true;
+      setVoiceInputStatus("recording");
+    } catch (error: unknown) {
+      cleanupVoiceInputResources();
+      setVoiceInputStatus("idle");
+      setLastError({
+        message: toErrorMessage(error),
+        type: "voice_input_error"
+      });
+    }
+  }, [cleanupVoiceInputResources, realtimeClient, status, voiceInputStatus]);
+
+  /**
+   * Stops microphone capture and optionally commits buffered input audio.
+   *
+   * @param options Stop behavior options.
+   */
+  const stopVoiceInput = useCallback(
+    (options?: { commit?: boolean }): void => {
+      if (voiceInputStatus !== "recording") {
+        return;
+      }
+
+      cleanupVoiceInputResources();
+      setVoiceInputStatus("idle");
+
+      const commit = options?.commit ?? true;
+      if (!commit || status !== "running") {
+        return;
+      }
+
+      realtimeClient.send({
+        type: "input_audio_buffer.commit"
+      });
+      realtimeClient.send({
+        response: {
+          modalities: ["text"]
+        },
+        type: "response.create"
+      });
+    },
+    [cleanupVoiceInputResources, realtimeClient, status, voiceInputStatus]
+  );
+
+  /**
    * Stops the voice agent websocket session.
    */
   const stop = useCallback((): void => {
+    stopVoiceInput({
+      commit: false
+    });
     setStatus("stopping");
     realtimeClient.disconnect();
     setActiveCallsById({});
     accumulatorStateRef.current = createToolCallAccumulatorState();
     setStatus("idle");
-  }, [realtimeClient]);
+  }, [realtimeClient, stopVoiceInput]);
 
   /**
    * Sends a client event to the runtime websocket session.
@@ -315,11 +469,24 @@ export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
       isRunning: status === "running",
       ...(lastError === undefined ? {} : { lastError }),
       sendEvent,
+      startVoiceInput,
       start,
       status,
-      stop
+      stopVoiceInput,
+      stop,
+      voiceInputStatus
     };
-  }, [activeCallsById, lastError, sendEvent, start, status, stop]);
+  }, [
+    activeCallsById,
+    lastError,
+    sendEvent,
+    start,
+    startVoiceInput,
+    status,
+    stop,
+    stopVoiceInput,
+    voiceInputStatus
+  ]);
 
   return (
     <VoiceAgentContext.Provider value={renderState}>
@@ -355,4 +522,88 @@ const handleErrorEvent = (
     type: event.error.type
   });
   setStatus("error");
+};
+
+/**
+ * Downsamples mono float32 PCM samples to a target sample rate.
+ *
+ * @param input Source mono samples.
+ * @param sourceRate Source sample rate.
+ * @param targetRate Target sample rate.
+ * @returns Downsampled mono samples.
+ */
+const downsampleMonoPcm = (
+  input: Float32Array,
+  sourceRate: number,
+  targetRate: number
+): Float32Array => {
+  if (sourceRate === targetRate) {
+    return input;
+  }
+
+  const ratio = sourceRate / targetRate;
+  const outputLength = Math.max(1, Math.floor(input.length / ratio));
+  const output = new Float32Array(outputLength);
+  let sourceIndex = 0;
+
+  for (let outputIndex = 0; outputIndex < outputLength; outputIndex += 1) {
+    const nextSourceIndex = Math.min(
+      input.length,
+      Math.floor((outputIndex + 1) * ratio)
+    );
+
+    let total = 0;
+    let count = 0;
+    while (sourceIndex < nextSourceIndex) {
+      total += input[sourceIndex] ?? 0;
+      count += 1;
+      sourceIndex += 1;
+    }
+
+    output[outputIndex] = count === 0 ? 0 : total / count;
+  }
+
+  return output;
+};
+
+/**
+ * Encodes mono float32 PCM samples into base64 PCM16 bytes.
+ *
+ * @param input Mono float32 samples in range [-1, 1].
+ * @returns Base64-encoded PCM16 payload.
+ */
+const encodePcm16Base64 = (input: Float32Array): string => {
+  const bytes = new Uint8Array(input.length * 2);
+
+  input.forEach((sample, index) => {
+    const clamped = Math.max(-1, Math.min(1, sample));
+    const int16Value =
+      clamped < 0 ? Math.round(clamped * 32768) : Math.round(clamped * 32767);
+    const byteOffset = index * 2;
+    bytes[byteOffset] = int16Value & 255;
+    bytes[byteOffset + 1] = (int16Value >> 8) & 255;
+  });
+
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+    const chunk = bytes.subarray(offset, offset + chunkSize);
+    binary += String.fromCharCode(...chunk);
+  }
+
+  return btoa(binary);
+};
+
+/**
+ * Converts unknown errors into a readable message.
+ *
+ * @param error Unknown error value.
+ * @returns Message string.
+ */
+const toErrorMessage = (error: unknown): string => {
+  if (error instanceof Error && error.message.length > 0) {
+    return error.message;
+  }
+
+  return "Unknown voice input error.";
 };

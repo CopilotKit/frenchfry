@@ -85,4 +85,7 @@ test("VoiceAgent remains connecting until runtime.connection.open", () => {
   expect(latest?.status).toBe("running");
   expect(latest?.isConnected).toBe(true);
   expect(latest?.isRunning).toBe(true);
+  expect(typeof latest?.startVoiceInput).toBe("function");
+  expect(typeof latest?.stopVoiceInput).toBe("function");
+  expect(latest?.voiceInputStatus).toBe("idle");
 });

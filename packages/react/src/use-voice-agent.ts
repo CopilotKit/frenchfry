@@ -29,9 +29,12 @@ export type VoiceAgentRenderState = {
       type: string;
     } & Record<string, unknown>
   ) => void;
+  startVoiceInput: () => Promise<void>;
   start: () => void;
   status: "connecting" | "error" | "idle" | "running" | "stopping";
+  stopVoiceInput: (options?: { commit?: boolean }) => void;
   stop: () => void;
+  voiceInputStatus: "idle" | "recording" | "unsupported";
 };
 
 /**

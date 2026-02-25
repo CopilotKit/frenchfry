@@ -10,6 +10,7 @@
   "scripts": {
     "build": "npm run -ws build",
     "clean": "rm -rf dist coverage .vitest **/*.tsbuildinfo",
+    "demo:dev": "set -a; [ -f .env ] && . ./.env; set +a; npm run dev --workspace @frenchfryai/demo-server & npm run dev --workspace @frenchfryai/demo-app & wait",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "lint": "eslint .",

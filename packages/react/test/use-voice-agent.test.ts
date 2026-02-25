@@ -48,13 +48,20 @@ test("useVoiceAgent returns context value when provider is present", () => {
     sendEvent: () => {
       return;
     },
+    startVoiceInput: () => {
+      return Promise.resolve();
+    },
     start: () => {
       return;
     },
     status: "running",
+    stopVoiceInput: () => {
+      return;
+    },
     stop: () => {
       return;
-    }
+    },
+    voiceInputStatus: "idle"
   };
 
   // Act
