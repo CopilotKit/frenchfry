@@ -1,3 +1,4 @@
+import { type Chat } from "@hashbrownai/core";
 import {
   type OpenAIClientEvent,
   createFunctionCallOutputEvents,
@@ -29,12 +30,12 @@ import {
 } from "react";
 import { Subscription } from "rxjs";
 
+import { type GenUiRegistration } from "./use-gen-ui";
 import {
   VoiceAgentContext,
   type ActiveToolCallState,
   type VoiceAgentRenderState
 } from "./use-voice-agent";
-import { type GenUiRegistration } from "./use-gen-ui";
 
 /**
  * Represents props for the `VoiceAgent` orchestration component.
@@ -48,7 +49,7 @@ export type VoiceAgentProps = {
   } & Record<string, unknown>;
   sessionEndpoint: string;
   toolTimeoutMs?: number;
-  tools?: readonly OrchestrationTool[];
+  tools?: readonly Chat.AnyTool[];
 };
 
 type SessionToolDefinition = {
@@ -69,6 +70,18 @@ export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
   const sessionSignature = useMemo(() => {
     return JSON.stringify(props.session);
   }, [props.session]);
+  const hashbrownSessionTools = useMemo<
+    readonly SessionToolDefinition[]
+  >(() => {
+    return props.tools?.map(toSessionToolFromHashbrownTool) ?? [];
+  }, [props.tools]);
+
+  const hashbrownOrchestrationTools = useMemo<
+    readonly OrchestrationTool[]
+  >(() => {
+    return props.tools?.map(toOrchestrationToolFromHashbrownTool) ?? [];
+  }, [props.tools]);
+
   const genUiSessionTools = useMemo<readonly SessionToolDefinition[]>(() => {
     return props.genUi?.map((registration) => registration.sessionTool) ?? [];
   }, [props.genUi]);
@@ -89,17 +102,17 @@ export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
   const toolRegistry = useMemo(() => {
     return createToolRegistry([
       ...genUiOrchestrationTools,
-      ...(props.tools ?? [])
+      ...hashbrownOrchestrationTools
     ]);
-  }, [genUiOrchestrationTools, props.tools]);
+  }, [genUiOrchestrationTools, hashbrownOrchestrationTools]);
 
   const accumulatorStateRef = useRef<ToolCallAccumulatorState>(
     createToolCallAccumulatorState()
   );
   const toolNameByCallIdRef = useRef<Map<string, string>>(new Map());
-  const genUiRegistrationsRef = useRef<readonly GenUiRegistration[] | undefined>(
-    props.genUi
-  );
+  const genUiRegistrationsRef = useRef<
+    readonly GenUiRegistration[] | undefined
+  >(props.genUi);
 
   useEffect(() => {
     genUiRegistrationsRef.current = props.genUi;
@@ -239,6 +252,7 @@ export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
     const existingSessionTools = extractSessionTools(props.session);
     const mergedTools = dedupeToolsByName([
       ...existingSessionTools,
+      ...hashbrownSessionTools,
       ...genUiSessionTools
     ]);
 
@@ -254,6 +268,7 @@ export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
     setGenUiToolsConfigured(true);
   }, [
     genUiSessionTools,
+    hashbrownSessionTools,
     genUiToolsConfigured,
     props.session,
     sendEvents,
@@ -656,6 +671,44 @@ const dedupeToolsByName = (
   }
 
   return Array.from(byName.values());
+};
+
+/**
+ * Converts a Hashbrown tool into a session tool definition for model visibility.
+ *
+ * @param tool Hashbrown tool.
+ * @returns Session tool definition.
+ */
+const toSessionToolFromHashbrownTool = (
+  tool: Chat.AnyTool
+): SessionToolDefinition => {
+  return {
+    description: tool.description,
+    name: tool.name,
+    parameters: tool.schema,
+    type: "function"
+  };
+};
+
+/**
+ * Converts a Hashbrown tool into an orchestration tool for runtime execution.
+ *
+ * @param tool Hashbrown tool.
+ * @returns Orchestration tool.
+ */
+const toOrchestrationToolFromHashbrownTool = (
+  tool: Chat.AnyTool
+): OrchestrationTool => {
+  return {
+    description: tool.description,
+    handler: async (
+      input: unknown,
+      abortSignal: AbortSignal
+    ): Promise<unknown> => {
+      return tool.handler(input, abortSignal);
+    },
+    name: tool.name
+  };
 };
 
 /**

@@ -378,7 +378,10 @@ test("VoiceAgent executes a done tool call once for duplicate done events", asyn
           handler: (input: unknown) => {
             return Promise.resolve(input);
           },
-          name: "echo"
+          name: "echo",
+          schema: {
+            type: "object"
+          }
         }
       ]
     })
@@ -435,7 +438,10 @@ test("VoiceAgent executes tool call from output-item.done and ignores later dupl
           handler: (input: unknown) => {
             return Promise.resolve(input);
           },
-          name: "echo"
+          name: "echo",
+          schema: {
+            type: "object"
+          }
         }
       ]
     })

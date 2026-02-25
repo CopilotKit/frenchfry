@@ -1,4 +1,3 @@
-import type { OrchestrationTool } from "@frenchfryai/core";
 import {
   FrenchfryProvider,
   VoiceAgent,
@@ -29,24 +28,6 @@ type LogEntry = {
   timestamp: string;
 };
 
-type SessionToolDefinition = {
-  description: string;
-  name: string;
-  parameters: unknown;
-  type: "function";
-};
-
-const lookupOrderToolParameters: unknown = {
-  additionalProperties: false,
-  properties: {
-    orderId: {
-      type: "string"
-    }
-  },
-  required: ["orderId"],
-  type: "object"
-};
-
 const statusPillPropsSchema = z.object({
   label: z.string(),
   tone: z.enum(["critical", "healthy", "watch"])
@@ -65,10 +46,6 @@ const taskListPropsSchema = z.object({
 
 const demoServerConfigSchema = z.object({
   realtimeSessionUrl: z.string().url()
-});
-
-const lookupOrderInputSchema = z.object({
-  orderId: z.string().min(1)
 });
 
 const defaultServerHttpUrl = "http://localhost:8787";
@@ -242,64 +219,6 @@ const waitFor = (ms: number, signal: AbortSignal): Promise<void> => {
       }
     );
   });
-};
-
-/**
- * Creates `VoiceAgent` runtime tool registrations from hashbrown tools.
- *
- * @param input Tool metadata and runtime handlers.
- * @returns Runtime tool list for `VoiceAgent`.
- */
-const useVoiceAgentTools = (input: {
-  lookupOrderEtaTool: {
-    description: string;
-    handler: (
-      input: { orderId: string },
-      abortSignal: AbortSignal
-    ) => Promise<unknown>;
-    name: string;
-  };
-}): {
-  sessionTools: readonly SessionToolDefinition[];
-  voiceAgentTools: readonly OrchestrationTool[];
-} => {
-  const sessionTools = useMemo<readonly SessionToolDefinition[]>(() => {
-    return [
-      {
-        description: input.lookupOrderEtaTool.description,
-        name: input.lookupOrderEtaTool.name,
-        parameters: lookupOrderToolParameters,
-        type: "function"
-      }
-    ];
-  }, [input.lookupOrderEtaTool]);
-
-  const voiceAgentTools = useMemo<readonly OrchestrationTool[]>(() => {
-    return [
-      {
-        description: input.lookupOrderEtaTool.description,
-        handler: async (
-          toolInput: unknown,
-          abortSignal: AbortSignal
-        ): Promise<unknown> => {
-          const parsed = lookupOrderInputSchema.safeParse(toolInput);
-          if (!parsed.success) {
-            return {
-              error: "Expected input object: { orderId: string }"
-            };
-          }
-
-          return input.lookupOrderEtaTool.handler(parsed.data, abortSignal);
-        },
-        name: input.lookupOrderEtaTool.name
-      }
-    ];
-  }, [input.lookupOrderEtaTool]);
-
-  return {
-    sessionTools,
-    voiceAgentTools
-  };
 };
 
 /**
@@ -530,10 +449,6 @@ export const App = (): ReactElement => {
     })
   });
 
-  const toolRegistrations = useVoiceAgentTools({
-    lookupOrderEtaTool
-  });
-
   if (config.isLoading) {
     return (
       <main className="app-shell">
@@ -591,11 +506,10 @@ export const App = (): ReactElement => {
             model: "gpt-realtime",
             output_modalities: ["audio"],
             tool_choice: "auto",
-            tools: toolRegistrations.sessionTools,
             type: "realtime"
           }}
           sessionEndpoint={config.realtimeSessionUrl}
-          tools={toolRegistrations.voiceAgentTools}
+          tools={[lookupOrderEtaTool]}
         >
           {() => {
             return <AgentConsole />;
