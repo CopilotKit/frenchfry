@@ -1,4 +1,4 @@
-import { type Chat } from "@hashbrownai/core";
+import { s, type Chat } from "@hashbrownai/core";
 import {
   type OpenAIClientEvent,
   createFunctionCallOutputEvents,
@@ -113,6 +113,9 @@ export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
   const genUiRegistrationsRef = useRef<
     readonly GenUiRegistration[] | undefined
   >(props.genUi);
+  const executeToolCallRef = useRef<
+    (event: FunctionCallArgumentsDoneEvent) => Promise<void>
+  >(async () => {});
 
   useEffect(() => {
     genUiRegistrationsRef.current = props.genUi;
@@ -245,7 +248,10 @@ export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
       return;
     }
 
-    if (genUiToolsConfigured || genUiSessionTools.length === 0) {
+    if (
+      genUiToolsConfigured ||
+      (genUiSessionTools.length === 0 && hashbrownSessionTools.length === 0)
+    ) {
       return;
     }
 
@@ -276,12 +282,12 @@ export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
   ]);
 
   /**
-   * Executes a done tool call and sends its structured function-call-output response.
-   *
-   * @param event Done event payload.
+   * Refreshes the latest tool-execution closure consumed by long-lived subscriptions.
    */
-  const executeToolCall = useCallback(
-    async (event: FunctionCallArgumentsDoneEvent): Promise<void> => {
+  useEffect(() => {
+    executeToolCallRef.current = async (
+      event: FunctionCallArgumentsDoneEvent
+    ): Promise<void> => {
       setActiveCallsById((previous) => {
         const existing = previous[event.call_id];
 
@@ -318,9 +324,8 @@ export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
         return remaining;
       });
       toolNameByCallIdRef.current.delete(event.call_id);
-    },
-    [sendEvents, toolRegistry, toolTimeoutMs]
-  );
+    };
+  }, [sendEvents, toolRegistry, toolTimeoutMs]);
 
   useEffect(() => {
     const subscription = new Subscription();
@@ -432,7 +437,7 @@ export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
             );
           });
 
-          void executeToolCall(event);
+          void executeToolCallRef.current(event);
           return;
         }
 
@@ -472,19 +477,14 @@ export const VoiceAgent = (props: VoiceAgentProps): ReactNode => {
           );
         });
 
-        void executeToolCall(outputItemDoneEvent);
+        void executeToolCallRef.current(outputItemDoneEvent);
       })
     );
 
     return (): void => {
       subscription.unsubscribe();
     };
-  }, [
-    applyAccumulatorEvent,
-    ensureRemoteAudioElement,
-    executeToolCall,
-    realtimeClient
-  ]);
+  }, [applyAccumulatorEvent, ensureRemoteAudioElement, realtimeClient]);
 
   useEffect(() => {
     return (): void => {
@@ -685,9 +685,29 @@ const toSessionToolFromHashbrownTool = (
   return {
     description: tool.description,
     name: tool.name,
-    parameters: tool.schema,
+    parameters: toRealtimeToolParameters(tool.schema),
     type: "function"
   };
+};
+
+/**
+ * Normalizes hashbrown tool schema inputs into plain JSON Schema for Realtime.
+ *
+ * @param schema Tool schema input.
+ * @returns JSON-serializable parameters payload.
+ */
+const toRealtimeToolParameters = (schema: Chat.AnyTool["schema"]): unknown => {
+  if (s.isHashbrownType(schema)) {
+    return s.toJsonSchema(schema);
+  }
+
+  if (s.isStandardJsonSchema(schema)) {
+    return schema["~standard"].jsonSchema.input({
+      target: "draft-07"
+    });
+  }
+
+  return schema;
 };
 
 /**

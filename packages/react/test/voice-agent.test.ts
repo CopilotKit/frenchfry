@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 
 import { act, render } from "@testing-library/react";
+import { s } from "@hashbrownai/core";
 import { Subject } from "rxjs";
 import { createElement, useState, type ReactNode } from "react";
 import { expect, test, vi } from "vitest";
@@ -292,6 +293,71 @@ test("VoiceAgent auto-registers genUi session tool on connection open", () => {
     },
     type: "session.update"
   });
+});
+
+test("VoiceAgent auto-registers hashbrown tools and normalizes schema for session.update", () => {
+  // Arrange
+  fakeRealtimeClient = createFakeRealtimeClient();
+  createRealtimeClientMock.mockClear();
+  sendMock.mockClear();
+
+  render(
+    createElement(VoiceAgent, {
+      children: () => null,
+      session: createSession(),
+      sessionEndpoint: "http://localhost/realtime/session",
+      tools: [
+        {
+          description: "Lookup order ETA",
+          handler: async () => {
+            return {
+              etaMinutes: 14
+            };
+          },
+          name: "lookup_order_eta",
+          schema: s.object("Order lookup input.", {
+            orderId: s.string("Unique order identifier.")
+          })
+        }
+      ]
+    })
+  );
+
+  // Act
+  act(() => {
+    fakeRealtimeClient.events$.next({
+      type: "runtime.connection.open"
+    });
+  });
+
+  // Assert
+  expect(sendMock).toHaveBeenCalledWith(
+    expect.objectContaining({
+      session: {
+        tools: [
+          expect.objectContaining({
+            description: "Lookup order ETA",
+            name: "lookup_order_eta",
+            parameters: expect.objectContaining({
+              additionalProperties: false,
+              description: "Order lookup input.",
+              properties: {
+                orderId: {
+                  description: "Unique order identifier.",
+                  type: "string"
+                }
+              },
+              required: ["orderId"],
+              type: "object"
+            }),
+            type: "function"
+          })
+        ],
+        type: "realtime"
+      },
+      type: "session.update"
+    })
+  );
 });
 
 test("VoiceAgent forwards tool argument chunks from toolCallStarts$ to genUi", () => {

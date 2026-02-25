@@ -448,6 +448,9 @@ export const App = (): ReactElement => {
       orderId: s.string("Unique order identifier.")
     })
   });
+  const tools = useMemo<readonly [typeof lookupOrderEtaTool]>(() => {
+    return [lookupOrderEtaTool];
+  }, [lookupOrderEtaTool]);
 
   if (config.isLoading) {
     return (
@@ -509,7 +512,7 @@ export const App = (): ReactElement => {
             type: "realtime"
           }}
           sessionEndpoint={config.realtimeSessionUrl}
-          tools={[lookupOrderEtaTool]}
+          tools={tools}
         >
           {() => {
             return <AgentConsole />;
