@@ -92,6 +92,12 @@ Notes:
 - Prefer standard library and existing dependencies first.
 - New dependencies require clear justification in PR/task notes.
 
+## Git Commit Conventions
+
+- Always use Conventional Commits for commit messages.
+- Follow the format: `type(scope): summary`
+- Use lowercase commit types such as `feat`, `fix`, `docs`, `refactor`, `test`, `chore`.
+
 ## Testing Requirements
 
 - Use `vitest`.
