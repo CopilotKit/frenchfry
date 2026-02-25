@@ -1,0 +1,4 @@
+interface:
+  display_name: "Frenchfry Scaffold + Render"
+  short_description: "Scaffold Frenchfry apps and Render blueprints"
+  default_prompt: "Use $scaffold-frenchfry-render to scaffold a Frenchfry runtime + React app, install npm packages, and generate a Render Blueprint."

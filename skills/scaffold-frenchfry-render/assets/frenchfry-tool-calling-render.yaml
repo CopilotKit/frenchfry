@@ -1,0 +1,37 @@
+services:
+  - type: web
+    name: frenchfry-runtime
+    runtime: node
+    plan: free
+    region: oregon
+    branch: main
+    autoDeploy: true
+    rootDir: .
+    buildCommand: npm ci && npm run build -w @app/runtime
+    startCommand: npm run start -w @app/runtime
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: APP_ORIGIN
+        value: https://frenchfry-web.onrender.com
+      - key: OPENAI_API_KEY
+        sync: false
+
+  - type: web
+    name: frenchfry-web
+    runtime: static
+    plan: free
+    region: oregon
+    branch: main
+    autoDeploy: true
+    rootDir: apps/web
+    buildCommand: npm ci && npm run build
+    staticPublishPath: ./dist
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
+    envVars:
+      - key: VITE_RUNTIME_URL
+        value: https://frenchfry-runtime.onrender.com
