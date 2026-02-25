@@ -1,0 +1,29 @@
+{
+  "name": "@frenchfryai/runtime",
+  "version": "0.1.0",
+  "private": false,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "@frenchfryai/core": "0.1.0"
+  },
+  "scripts": {
+    "build": "tsc -b tsconfig.build.json",
+    "lint": "eslint src test",
+    "test": "vitest run test",
+    "typecheck": "tsc -b tsconfig.json"
+  }
+}

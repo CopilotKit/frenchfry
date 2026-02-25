@@ -1,0 +1,17 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "baseUrl": ".",
+    "declaration": true,
+    "declarationMap": true,
+    "noEmit": false,
+    "outDir": "dist",
+    "paths": {
+      "@frenchfryai/runtime": ["../../packages/runtime/dist/index.d.ts"]
+    },
+    "rootDir": "src",
+    "tsBuildInfoFile": "dist/tsconfig.build.tsbuildinfo"
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["test/**/*.ts"]
+}

@@ -1,0 +1,16 @@
+{
+  "name": "@frenchfryai/demo-server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -b tsconfig.build.json",
+    "dev": "tsx watch src/index.ts",
+    "lint": "eslint src test",
+    "test": "vitest run test",
+    "typecheck": "tsc -b tsconfig.json"
+  },
+  "dependencies": {
+    "@frenchfryai/runtime": "0.1.0"
+  }
+}
